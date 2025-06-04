@@ -163,7 +163,16 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
         case BotControlCommandType::Attack:
             if (!command.args.empty())
             {
-                uint32 lowGuid = std::stoul(command.args[0]);
+                uint32 lowGuid = 0;
+        try {
+            lowGuid = std::stoul(command.args[0]);
+        } catch (const std::invalid_argument& e) {
+            LOG_ERROR("OllamaBotBuddy", "Invalid argument for lowGuid '{}'", command.args[0]);
+            return false;
+        } catch (const std::out_of_range& e) {
+            LOG_ERROR("OllamaBotBuddy", "Out of range value for lowGuid '{}'", command.args[0]);
+            return false;
+        }
 
                 // Try to find the Creature by LowGuid first
                 Creature* creatureTarget = nullptr;
@@ -199,7 +208,16 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
         case BotControlCommandType::Interact:
             if (!command.args.empty())
             {
-                uint32 lowGuid = std::stoul(command.args[0]);
+                uint32 lowGuid = 0;
+        try {
+            lowGuid = std::stoul(command.args[0]);
+        } catch (const std::invalid_argument& e) {
+            LOG_ERROR("OllamaBotBuddy", "Invalid argument for lowGuid '{}'", command.args[0]);
+            return false;
+        } catch (const std::out_of_range& e) {
+            LOG_ERROR("OllamaBotBuddy", "Out of range value for lowGuid '{}'", command.args[0]);
+            return false;
+        }
                 Creature* creatureTarget = nullptr;
                 GameObject* goTarget = nullptr;
 
@@ -244,11 +262,29 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
         case BotControlCommandType::CastSpell:
             if (!command.args.empty())
             {
-                uint32 spellId = std::stoi(command.args[0]);
+                uint32 spellId = 0;
+        try {
+            spellId = std::stoi(command.args[0]);
+        } catch (const std::invalid_argument& e) {
+            LOG_ERROR("OllamaBotBuddy", "Invalid argument for spellId '{}'", command.args[0]);
+            return false;
+        } catch (const std::out_of_range& e) {
+            LOG_ERROR("OllamaBotBuddy", "Out of range value for spellId '{}'", command.args[0]);
+            return false;
+        }
                 Unit* target = nullptr;
                 if (command.args.size() > 1)
                 {
-                    uint32 lowGuid = std::stoul(command.args[1]);
+                    uint32 lowGuid = 0;
+        try {
+            lowGuid = std::stoul(command.args[1]);
+        } catch (const std::invalid_argument& e) {
+            LOG_ERROR("OllamaBotBuddy", "Invalid argument for lowGuid '{}'", command.args[1]);
+            return false;
+        } catch (const std::out_of_range& e) {
+            LOG_ERROR("OllamaBotBuddy", "Out of range value for lowGuid '{}'", command.args[1]);
+            return false;
+        }
                     // Try to find creature by lowGuid
                     for (auto const& pair : bot->GetMap()->GetCreatureBySpawnIdStore())
                     {
