@@ -9,7 +9,7 @@
 #include <deque>
 #include <chrono>
 
-// Uchovává poslední zprávy: [bot GUID][playerName] => pair<text, timestamp>
+// Stores the last messages: [bot GUID][playerName] => pair<text, timestamp>
 std::unordered_map<uint64_t, std::unordered_map<std::string, std::pair<std::string, std::chrono::steady_clock::time_point>>> lastMessages;
 std::mutex botPlayerMessagesMutex;
 
@@ -51,7 +51,7 @@ void BotBuddyChatHandler::ProcessChat(Player* player, uint32_t type, uint32_t la
         std::transform(messageLower.begin(), messageLower.end(), messageLower.begin(), ::tolower);
         std::transform(botNameLower.begin(), botNameLower.end(), botNameLower.begin(), ::tolower);
 
-        // Pokud hráč zmiňuje bota ve zprávě
+        // If the player mentions the bot in the message
         if (messageLower.find(botNameLower) != std::string::npos)
         {
             uint64_t botGuid = bot->GetGUID().GetRawValue();
@@ -59,24 +59,24 @@ void BotBuddyChatHandler::ProcessChat(Player* player, uint32_t type, uint32_t la
             auto& lastMsgMap = lastMessages[botGuid];
 
             auto now = std::chrono::steady_clock::now();
-            constexpr auto cooldown = std::chrono::seconds(3); // min. interval mezi stejnou zprávou
+            constexpr auto cooldown = std::chrono::seconds(3); // minimum interval between the same message
 
-            // Kontrola na spam: pokud poslal stejnou zprávu před chvílí, ignorujeme
+            // Spam check: if the same message was sent recently, ignore it
             auto it = lastMsgMap.find(playerName);
             if (it != lastMsgMap.end()) {
                 const auto& [lastText, lastTime] = it->second;
                 if (lastText == msg && (now - lastTime) < cooldown) {
                     LOG_DEBUG("server.loading", "Duplicate chat command from player={} to bot={}, ignored.", playerName, botNameLower);
-                    continue; // Přeskočit tuto zprávu
+                    continue; // Skip this message
                 }
             }
-            // Uložit poslední zprávu a čas
+            // Save the last message and time
             lastMsgMap[playerName] = std::make_pair(msg, now);
 
-            // Tady bys mohl mít původní ukládání zprávy, pokud není spam:
+            // Here you could store the original message if it's not spam:
             // botPlayerMessages[botGuid].emplace_back(playerName, msg);
-            // Pokud chceš zpětně kompatibilní buffer, můžeš zachovat tuto queue:
-            // případně limituj velikost fronty (třeba posledních 20 zpráv)
+            // If you want a backward-compatible buffer, you can keep this queue:
+            // optionally limit the queue size (e.g. last 20 messages)
         }
     }
 }
