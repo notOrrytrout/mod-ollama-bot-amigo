@@ -10,7 +10,7 @@
 #include <chrono>
 
 // Stores the last messages: [bot GUID][playerName] => pair<text, timestamp>
-std::unordered_map<uint64_t, std::unordered_map<std::string, std::pair<std::string, std::chrono::steady_clock::time_point>>> lastMessages;
+std::unordered_map<uint64_t, std::unordered_map<std::string, std::pair<std::string, std::chrono::steady_clock::time_point>>> botPlayerMessages;
 std::mutex botPlayerMessagesMutex;
 
 void BotBuddyChatHandler::OnPlayerChat(Player* player, uint32_t type, uint32_t lang, std::string& msg)
@@ -73,10 +73,6 @@ void BotBuddyChatHandler::ProcessChat(Player* player, uint32_t type, uint32_t la
             // Save the last message and time
             lastMsgMap[playerName] = std::make_pair(msg, now);
 
-            // Here you could store the original message if it's not spam:
-            // botPlayerMessages[botGuid].emplace_back(playerName, msg);
-            // If you want a backward-compatible buffer, you can keep this queue:
-            // optionally limit the queue size (e.g. last 20 messages)
         }
     }
 }
