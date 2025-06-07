@@ -912,6 +912,7 @@ static std::string BuildBotPrompt(Player* bot)
     - When choosing a target, move toward them if not in range. Use 'attack' only once you're within melee or casting distance (distance < 2).
     - If you're too close to your target (distance <= 0.15) then move away before attacking again.
     - DO NOT TRY TO ATTACK OR DEFEND FROM CREATURES TAGGED AS DEAD.
+    - BE AGGRESSIVE, killing things around your level grants you XP to level up. Attack monsters nearby to help level up.
     - If you're under level 5 PRIORITIZE attacking Neutral creatures, but after level 5 only prioritize attacking Hostile creatures.
 
     DECISION RULE:
