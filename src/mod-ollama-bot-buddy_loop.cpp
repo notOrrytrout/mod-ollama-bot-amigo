@@ -911,16 +911,18 @@ static std::string BuildBotPrompt(Player* bot)
     - During combat, do NOT disengage or move away unless your HP is low or the enemy is significantly stronger.
     - When choosing a target, move toward them if not in range. Use 'attack' only once you're within melee or casting distance (distance < 2).
     - If you're too close to your target (distance <= 0.15) then move away before attacking again.
+    - DO NOT TRY TO ATTACK OR DEFEND FROM CREATURES TAGGED AS DEAD.
     - If you're under level 5 PRIORITIZE attacking Neutral creatures, but after level 5 only prioritize attacking Hostile creatures.
 
     DECISION RULE:
     - Always choose the most effective single action to level up, complete quests, gain gear, or respond to threats.
     - ANY other format or additional text reply is INVALID.
     - Base your decisions on the current game state, visible objects, group status, and your last 5 commands along with their reasoning. For example, if your previous command was to move and attack a target, and that target is still present and within range, your next action should likely be to execute an attack command.
+    - If a Dead creature is tagged as Lootable, try to loot its body.
     
     NAVIGATION:
     - Use ONLY GUIDs or coordinates listed in visible objects or navigation options.
-    - NEVER make up IDs, GUIDs, or coordinates.s
+    - NEVER make up IDs, GUIDs, or coordinates.
     - If nothing useful is visible, choose a waypoint or unexplored coordinate and move there.
     - If you're in a group, try to stay within 5-10 distance of another group member if you're not engaged in combat.
     - Do not move DIRECTLY on top of other players, creatures or objects, always maintain a small distance to avoid collision issues.
