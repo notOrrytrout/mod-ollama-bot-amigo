@@ -29,7 +29,7 @@ namespace BotBuddyAI
         if (!bot || !guid) return false;
 
         Unit* target = ObjectAccessor::GetUnit(*bot, guid);
-        if (!target || !bot->IsHostileTo(target) || !bot->IsWithinLOSInMap(target)) return false;
+        if (!target || !bot->IsWithinLOSInMap(target)) return false;
 
         bot->SetSelection(target->GetGUID());
         bot->SetFacingToObject(target);

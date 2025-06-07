@@ -24,3 +24,9 @@ OllamaBotControl.Model = llama3.2:1b
 #     Default:     0 (false)
 #     0 = disabled, 1 = enabled
 OllamaBotControl.Debug = 0
+
+# OllamaBotControl.EnableBotBuddyAddon
+#     Description: Enable or disable sending the bot state to the Bot Buddy addon for Ollama Bot.
+#     Default:     0 (false)
+#     0 = disabled, 1 = enabled
+OllamaBotControl.EnableBotBuddyAddon = 0

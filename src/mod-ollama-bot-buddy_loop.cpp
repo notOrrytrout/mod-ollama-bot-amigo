@@ -35,6 +35,9 @@
 static std::unordered_map<uint64_t, std::deque<std::string>> botCommandHistory;
 static std::mutex botCommandHistoryMutex;
 
+static std::unordered_map<uint64_t, std::deque<std::string>> botReasoningHistory;
+static std::mutex botReasoningHistoryMutex;
+
 std::vector<std::string> GetRecentPlayerMessagesToBot(Player* bot)
 {
     std::vector<std::string> messages;
@@ -78,6 +81,153 @@ std::string FormatPlayerMessagesPromptSegment(Player* bot)
 
     }
     return oss.str();
+}
+
+bool ParseAndExecuteBotJson(Player* bot, const std::string& jsonStr)
+{
+    try
+    {
+        auto root = nlohmann::json::parse(jsonStr);
+
+        if (!root.contains("command")) return false;
+        auto cmd = root["command"];
+        if (!cmd.contains("type") || !cmd.contains("params")) return false;
+
+        std::string type = cmd["type"].get<std::string>();
+        auto params = cmd["params"];
+        std::string sayMsg = root.value("say", "");
+        std::string reasoning = root.value("reasoning", "");
+
+        BotControlCommand command;
+
+        if (!reasoning.empty())
+        {
+            AddBotReasoningHistory(bot, reasoning);
+        }
+         if (!cmd.empty())
+        {
+            AddBotCommandHistory(bot, cmd.dump());
+        }
+
+        if (type == "move_to")
+        {
+            if (params.contains("x") && params.contains("y") && params.contains("z")) {
+                command.type = BotControlCommandType::MoveTo;
+                command.args = {
+                    std::to_string(params["x"].get<float>()),
+                    std::to_string(params["y"].get<float>()),
+                    std::to_string(params["z"].get<float>())
+                };
+            } else {
+                LOG_ERROR("server.loading", "[OllamaBotBuddy] move_to missing parameter");
+                return false;
+            }
+        }
+        else if (type == "attack")
+        {
+            if (params.contains("guid")) {
+                command.type = BotControlCommandType::Attack;
+                command.args = { std::to_string(params["guid"].get<uint32_t>()) };
+            } else {
+                LOG_ERROR("server.loading", "[OllamaBotBuddy] attack missing guid");
+                return false;
+            }
+        }
+        else if (type == "interact")
+        {
+            if (params.contains("guid")) {
+                command.type = BotControlCommandType::Interact;
+                command.args = { std::to_string(params["guid"].get<uint32_t>()) };
+            } else {
+                LOG_ERROR("server.loading", "[OllamaBotBuddy] interact missing guid");
+                return false;
+            }
+        }
+        else if (type == "spell")
+        {
+            if (params.contains("spellid")) {
+                command.type = BotControlCommandType::CastSpell;
+                command.args = { std::to_string(params["spellid"].get<uint32_t>()) };
+                if (params.contains("guid"))
+                    command.args.push_back(std::to_string(params["guid"].get<uint32_t>()));
+            } else {
+                LOG_ERROR("server.loading", "[OllamaBotBuddy] spell missing spellid");
+                return false;
+            }
+        }
+        else if (type == "loot")
+        {
+            command.type = BotControlCommandType::Loot;
+        }
+        else if (type == "accept_quest")
+        {
+            if (params.contains("id")) {
+                command.type = BotControlCommandType::AcceptQuest;
+                command.args = { std::to_string(params["id"].get<uint32_t>()) };
+            } else {
+                LOG_ERROR("server.loading", "[OllamaBotBuddy] accept_quest missing id");
+                return false;
+            }
+        }
+        else if (type == "turn_in_quest")
+        {
+            if (params.contains("id")) {
+                command.type = BotControlCommandType::TurnInQuest;
+                command.args = { std::to_string(params["id"].get<uint32_t>()) };
+            } else {
+                LOG_ERROR("server.loading", "[OllamaBotBuddy] turn_in_quest missing id");
+                return false;
+            }
+        }
+        else if (type == "follow")
+        {
+            command.type = BotControlCommandType::Follow;
+        }
+        else if (type == "stop")
+        {
+            command.type = BotControlCommandType::Stop;
+        }
+        else
+        {
+            LOG_ERROR("server.loading", "[OllamaBotBuddy] Unknown command type '{}'", type);
+            return false;
+        }
+
+        bool result = HandleBotControlCommand(bot, command);
+
+        if (!sayMsg.empty())
+            BotBuddyAI::Say(bot, sayMsg);
+
+        if (g_EnableOllamaBotBuddyDebug)
+        {
+            LOG_INFO("server.loading", "Bot Reply: {}", jsonStr);
+        }
+
+        return result;
+    }
+    catch (const std::exception& e)
+    {
+        LOG_ERROR("server.loading", "[OllamaBotBuddy] ParseAndExecuteBotJson error: {}", e.what());
+        return false;
+    }
+}
+
+std::string ExtractFirstJsonObject(const std::string& input) {
+    int depth = 0;
+    size_t start = std::string::npos;
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '{') {
+            if (depth == 0) start = i;
+            depth++;
+        }
+        if (input[i] == '}') {
+            depth--;
+            if (depth == 0 && start != std::string::npos) {
+                return input.substr(start, i - start + 1);
+            }
+        }
+    }
+    return ""; // No JSON object found
 }
 
 std::vector<std::string> GetGroupStatus(Player* bot)
@@ -195,6 +345,46 @@ std::string GetBotSpellInfo(Player* bot)
     return spellSummary.str();
 }
 
+void SendBuddyBotStateToPlayer(Player* target, Player* bot, const std::string& prompt)
+{
+    if (!target || !bot || !g_EnableBotBuddyAddon) return;
+
+    // Only keep everything before instructions for the UI
+    std::string state = prompt;
+    std::string::size_type json_pos = state.find("You are an AI-controlled bot");
+    if (json_pos != std::string::npos)
+        state = state.substr(0, json_pos);
+
+    std::vector<std::string> cmds = GetBotCommandHistory(bot);
+    std::string lastCmd = cmds.empty() ? "None" : cmds.back();
+
+    std::vector<std::string> reasons = GetBotReasoningHistory(bot);
+    std::string lastReason = reasons.empty() ? "None" : reasons.back();
+
+    // Replace all '\n' with ' || ' so the message stays as one line
+    auto flatten = [](const std::string& input) {
+        std::string output = input;
+        size_t pos = 0;
+        while ((pos = output.find('\n', pos)) != std::string::npos) {
+            output.replace(pos, 1, " || ");
+            pos += 4;
+        }
+        return output;
+    };
+
+    std::string flatState = flatten(state);
+    std::string flatCmd = flatten(lastCmd);
+    std::string flatReason = flatten(lastReason);
+
+    if (target && target->GetSession()) {
+        ChatHandler handler(target->GetSession());
+        handler.SendSysMessage(("[BUDDY_STATE] " + flatState).c_str());
+        handler.SendSysMessage(("[BUDDY_COMMAND] " + flatCmd).c_str());
+        handler.SendSysMessage(("[BUDDY_REASON] " + flatReason).c_str());
+    }
+}
+
+
 std::vector<std::string> GetVisiblePlayers(Player* bot, float radius = 100.0f)
 {
     std::vector<std::string> players;
@@ -263,6 +453,16 @@ void AddBotCommandHistory(Player* bot, const std::string& command)
     if (dq.size() > 5) dq.pop_front();
 }
 
+void AddBotReasoningHistory(Player* bot, const std::string& reasoning)
+{
+    if (!bot || reasoning.empty()) return;
+    std::lock_guard<std::mutex> lock(botReasoningHistoryMutex);
+    uint64_t guid = bot->GetGUID().GetRawValue();
+    auto& dq = botReasoningHistory[guid];
+    dq.push_back(reasoning);
+    if (dq.size() > 5) dq.pop_front();
+}
+
 
 std::vector<std::string> GetBotCommandHistory(Player* bot)
 {
@@ -272,6 +472,17 @@ std::vector<std::string> GetBotCommandHistory(Player* bot)
     uint64_t guid = bot->GetGUID().GetRawValue();
     if (botCommandHistory.count(guid))
         out.assign(botCommandHistory[guid].begin(), botCommandHistory[guid].end());
+    return out;
+}
+
+std::vector<std::string> GetBotReasoningHistory(Player* bot)
+{
+    std::vector<std::string> out;
+    if (!bot) return out;
+    std::lock_guard<std::mutex> lock(botReasoningHistoryMutex);
+    uint64_t guid = bot->GetGUID().GetRawValue();
+    if (botReasoningHistory.count(guid))
+        out.assign(botReasoningHistory[guid].begin(), botReasoningHistory[guid].end());
     return out;
 }
 
@@ -672,68 +883,94 @@ static std::string BuildBotPrompt(Player* bot)
 
     std::vector<std::string> cmdHist = GetBotCommandHistory(bot);
 
-    if (!cmdHist.empty())
+    std::vector<std::string> reasoningHist = GetBotReasoningHistory(bot);
+
+
+    if (!cmdHist.empty() && !reasoningHist.empty())
     {
-        oss << "Last 5 commands you sent with the most recent at the bottom:\n";
-        for (const auto& cmd : cmdHist)
+        oss << "Last 5 commands and their reasoning (most recent at the bottom):\n";
+        for (size_t i = 0; i < cmdHist.size() && i < reasoningHist.size(); ++i)
         {
-            oss << " - " << cmd << "\n";
+            oss << " - Command: " << cmdHist[i] << "\n";
+            oss << "   Reasoning: " << reasoningHist[i] << "\n";
         }
     }
 
     if (g_EnableOllamaBotBuddyDebug)
     {
-        LOG_INFO("server.loading", "[OllamaBotBuddy] Bot Snapshot for '{}': {}", botName, oss.str());
+        std::string safeSnapshot = EscapeBracesForFmt(oss.str());
+        LOG_INFO("server.loading", "[OllamaBotBuddy] Bot Snapshot for '{}': {}", botName, safeSnapshot);
     }
 
-    oss << "You are an AI-controlled bot in World of Warcraft. Your task is to follow these strict rules and reply only with the listed acceptable commands:\n";
-    oss << "Primary goal: Level to 80 and equip the best gear. Prioritize combat, questing and quest givers, talking to other players and efficient progression. If no quests or viable enemies are nearby, explore for new quests, dungeons, raids, professions, or gold opportunities.\n";
-    oss << "\n";
-    oss << "COMBAT RULES:\n";
-    oss << "- If you or a player in your group are under attack, IMMEDIATELY prioritize defense. Attack the enemy targeting you or your group, or escape if the enemy is much higher level.\n";
-    oss << "- During combat, do NOT disengage or move away unless your HP is low or the enemy is significantly stronger.\n";
-    oss << "- When choosing a target, move toward them if not in range. Use 'attack' only once you're within melee or casting distance (distance < 2).\n";
-    oss << "- If you're too close to your target (distance <= 0.15) then move away before attacking again.\n";
-    oss << "\n";
-    oss << "DECISION RULE:\n";
-    oss << "- Always choose the most effective single action to level up, complete quests, gain gear, or respond to threats.\n";
-    oss << "- Only use ONE of the following commands:\n";
-    oss << "   move to <x> <y> <z>\n";
-    oss << "   attack <guid>\n";
-    oss << "   spell <spellid> <guid>\n";
-    oss << "   interact <guid>\n";
-    oss << "   loot\n";
-    oss << "   say <message>\n";
-    oss << "   acceptquest <id>\n";
-    oss << "   turninquest <id>\n";
-    oss << "   stop\n";
-    oss << "- ANY other format or additional text reply is INVALID.\n";
-    oss << "\n";
-    oss << "NAVIGATION:\n";
-    oss << "- Use ONLY GUIDs or coordinates listed in visible objects or navigation options.\n";
-    oss << "- NEVER make up IDs, GUIDs, or coordinates.\n";
-    oss << "- If nothing useful is visible, choose a waypoint or unexplored coordinate and move there.\n";
-    oss << "- If you're in a group, try to stay within 5-10 distance of another group member if you're not engaged in combat.\n";
-    oss << "\n";
-    oss << "COMMUNICATION:\n";
-    oss << "- Use 'say <message>' to announce goals, movement, or status when moving, finishing quests, entering combat, idling, or seeing nearby real players.\n";
-    oss << "\n";
-    oss << "IMPORTANT FORMATTING RULE:\n";
-    oss << "- Respond with EXACTLY ONE command. No summaries. No commentary. No dialogue. No bullet points.\n";
-    oss << "- NEVER EVER REPLY WITH ANYTHING THAT IS NOT A SINGLE COMMAND FROM THE ABOVE LIST.\n";
-    oss << "\n";
-    oss << "Correct examples:\n";
-    oss << "   attack 2241\n";
-    oss << "   move to -9347.02 256.48 65.10\n";
-    oss << "   say Moving to explore new quest area\n";
-    oss << "   loot\n";
-    oss << "   interact 2343\n";
-    oss << "   spell 2098 2241\n";
-    oss << "\n";
-    oss << "Incorrect examples (DO NOT DO THIS):\n";
-    oss << "   I will attack the enemy now\n";
-    oss << "   Let's go! move to -9347.02 256.48 65.10\n";
-    oss << "   Command: attack 2241\n";
+    oss << R"(You are an AI-controlled bot in World of Warcraft. Your task is to follow these strict rules and reply only with the listed acceptable commands:
+
+    Primary goal: Level to 80 and equip the best gear. Prioritize combat, questing and quest givers, talking to other players and efficient progression. If no quests or viable enemies are nearby, explore for new quests, dungeons, raids, professions, or gold opportunities.
+
+    COMBAT RULES:
+    - If you or a player in your group are under attack, IMMEDIATELY prioritize defense. Attack the enemy targeting you or your group, or escape if the enemy is much higher level.
+    - During combat, do NOT disengage or move away unless your HP is low or the enemy is significantly stronger.
+    - When choosing a target, move toward them if not in range. Use 'attack' only once you're within melee or casting distance (distance < 2).
+    - If you're too close to your target (distance <= 0.15) then move away before attacking again.
+    - If you're under level 5 PRIORITIZE attacking Neutral creatures, but after level 5 only prioritize attacking Hostile creatures.
+
+    DECISION RULE:
+    - Always choose the most effective single action to level up, complete quests, gain gear, or respond to threats.
+    - ANY other format or additional text reply is INVALID.
+    - Base your decisions on the current game state, visible objects, group status, and your last 5 commands along with their reasoning. For example, if your previous command was to move and attack a target, and that target is still present and within range, your next action should likely be to execute an attack command.
+    
+    NAVIGATION:
+    - Use ONLY GUIDs or coordinates listed in visible objects or navigation options.
+    - NEVER make up IDs, GUIDs, or coordinates.s
+    - If nothing useful is visible, choose a waypoint or unexplored coordinate and move there.
+    - If you're in a group, try to stay within 5-10 distance of another group member if you're not engaged in combat.
+    - Do not move DIRECTLY on top of other players, creatures or objects, always maintain a small distance to avoid collision issues.
+
+    COMMUNICATION:
+    - Be chatty only in the say field! Talk to other players, comment on things or people around you or your intentions and goals.
+    - To make your character say something to players, put the message as a string in the top-level "say" field.
+    - Make yourself seem as human as possible, ask players for help if you don't understand something or need help finding something or killing something or completing a quest. Ask a nearby real player and use their response in your reasoning.
+
+    CRITICALLY IMPORTANT: Reply with EXACTLY and ONLY a single valid JSON object, no extra text, no comments, no code block formatting. Your JSON must be:
+    {
+    "command": { "type": <string>, "params": { ... } },
+    "reasoning": <string>,
+    "say": <string>
+    }
+
+    Allowed "type" values and required params:
+
+    - "move_to": params = { "x": float, "y": float, "z": float }
+    - "attack": params = { "guid": int }
+    - "interact": params = { "guid": int }
+    - "spell": params = { "spellid": int, "guid": int (omit if self-cast) }
+    - "loot": params = { }
+    - "accept_quest": params = { "id": int }
+    - "turn_in_quest": params = { "id": int }
+    - "follow": params = { }
+    - "stop": params = { }
+
+    "reasoning" must be a short natural-language explanation for why you chose this command.
+    "say" must be what your character would say in-game to players, or "" if nothing is to be said. You can use this to communicate with players, but do not use it for commands.
+
+    EXAMPLES:
+    {
+    "command": { "type": "move_to", "params": { "x": -9347.02, "y": 256.48, "z": 65.10 } },
+    "reasoning": "Moving to the quest NPC as ordered by the player.",
+    "say": "On my way."
+    }
+    {
+    "command": { "type": "attack", "params": { "guid": 2241 } },
+    "reasoning": "Attacking the nearest enemy.",
+    "say": "Engaging the enemy."
+    }
+    {
+    "command": { "type": "loot", "params": { } },
+    "reasoning": "Looting the corpse.",
+    "say": "Looting now."
+    }
+
+    REMEMBER: NEVER REPLY WITH ANYTHING OTHER THAN A VALID JSON OBJECT!!!
+    )";
 
 
     return oss.str();
@@ -749,6 +986,21 @@ namespace
     std::unordered_map<uint64_t, OllamaBotState> ollamaBotStates;
 }
 
+std::string EscapeBracesForFmt(const std::string& input) {
+    std::string output;
+    output.reserve(input.size() * 2); // Avoid lots of reallocs
+
+    for (char c : input) {
+        if (c == '{' || c == '}') {
+            output.push_back(c); // first brace
+            output.push_back(c); // second brace
+        } else {
+            output.push_back(c);
+        }
+    }
+    return output;
+}
+
 void OllamaBotControlLoop::OnUpdate(uint32 diff)
 {
     if (!g_EnableOllamaBotControl) return;
@@ -758,14 +1010,19 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
         Player* bot = itr.second;
         if (!bot->IsInWorld()) continue;
         std::string botName = bot->GetName();
+
+        // Temporary marker for testing
         if (botName != "Ollamatest") continue;
 
+        // Clear the normal Playerbot AI
         PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
         if (ai)
         {
             ai->ClearStrategies(BOT_STATE_COMBAT);
             ai->ClearStrategies(BOT_STATE_NON_COMBAT);
             ai->ClearStrategies(BOT_STATE_DEAD);
+        } else {
+            continue;
         }
 
         uint64_t guid = bot->GetGUID().GetRawValue();
@@ -789,12 +1046,21 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
 
                 if (g_EnableOllamaBotBuddyDebug)
                 {
-                    LOG_INFO("server.loading", "[OllamaBotBuddy] LLM reply for '{}': {}", bot->GetName(), llmReply);
+                    std::string safeJson = EscapeBracesForFmt(llmReply);
+                    LOG_INFO("server.loading", "[OllamaBotBuddy] LLM reply for '{}':\n{}", bot->GetName(), safeJson);
+
                 }
 
                 if (!llmReply.empty())
                 {
-                    ParseBotControlCommand(bot, llmReply);
+                    std::string jsonOnly = ExtractFirstJsonObject(llmReply);
+                    if (!jsonOnly.empty()) {
+                        SendBuddyBotStateToPlayer(bot, bot, prompt);
+                        ParseAndExecuteBotJson(bot, jsonOnly);
+
+                    } else {
+                        LOG_ERROR("server.loading", "[OllamaBotBuddy] No valid JSON object found in LLM reply: {}", llmReply);
+                    }
                 }
 
                 // Mark ready for the next request
