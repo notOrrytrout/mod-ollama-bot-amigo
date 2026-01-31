@@ -32,7 +32,7 @@ void BotBuddyChatHandler::ProcessChat(Player* player, uint32_t type, uint32_t la
     player ? player->GetName() : "NULL", type, lang, msg, channel ? channel->GetName() : "nullptr");
 
     if (!player || msg.empty()) return;
-    PlayerbotAI* senderAI = sPlayerbotsMgr->GetPlayerbotAI(player);
+    PlayerbotAI* senderAI = PlayerbotsMgr::instance().GetPlayerbotAI(player);
     if (senderAI && senderAI->IsBotAI()) return;
 
     std::lock_guard<std::mutex> lock(botPlayerMessagesMutex);
@@ -43,7 +43,7 @@ void BotBuddyChatHandler::ProcessChat(Player* player, uint32_t type, uint32_t la
         Player* bot = itr.second;
         if (!bot || !bot->IsAlive()) continue;
 
-        PlayerbotAI* botAI = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!botAI || !botAI->IsBotAI()) continue;
 
         std::string messageLower = msg;

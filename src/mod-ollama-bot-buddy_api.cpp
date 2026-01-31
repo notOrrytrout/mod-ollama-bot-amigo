@@ -29,7 +29,7 @@ namespace BotBuddyAI
     {
         if (!bot) return false;
         
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
         
         if (g_EnableOllamaBotBuddyDebug) {
@@ -73,7 +73,7 @@ namespace BotBuddyAI
     {
         if (!bot || !guid) return false;
 
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
 
         Unit* target = ObjectAccessor::GetUnit(*bot, guid);
@@ -220,7 +220,7 @@ namespace BotBuddyAI
     {
         if (!bot || !guid) return false;
 
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
 
         if (Creature* creature = ObjectAccessor::GetCreature(*bot, guid))
@@ -303,7 +303,7 @@ namespace BotBuddyAI
     {
         if (!bot || !questGiver) return false;
 
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
 
         // Check interaction distance
@@ -313,7 +313,7 @@ namespace BotBuddyAI
         }
 
         // Face the quest giver
-        if (!bot->HasInArc(CAST_ANGLE_IN_FRONT, questGiver, sPlayerbotAIConfig->sightDistance))
+        if (!bot->HasInArc(CAST_ANGLE_IN_FRONT, questGiver, sPlayerbotAIConfig.sightDistance))
             bot->SetFacingToObject(questGiver);
 
         ObjectGuid guid = questGiver->GetGUID();
@@ -394,7 +394,7 @@ namespace BotBuddyAI
     {
         if (!bot || !creature) return false;
 
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
 
         // Start gossip interaction
@@ -532,7 +532,7 @@ namespace BotBuddyAI
     {
         if (!bot) return false;
         
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
         
         SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
@@ -593,7 +593,7 @@ namespace BotBuddyAI
     {
         if (!bot) return false;
         
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
         
         // Use the bot's AI system to handle saying
@@ -605,7 +605,7 @@ namespace BotBuddyAI
     {
         if (!bot) return false;
         
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
         
         // Use the bot's AI system to handle following
@@ -617,7 +617,7 @@ namespace BotBuddyAI
     {
         if (!bot) return false;
         
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
         
         // Use the bot's AI system to handle stopping
@@ -629,7 +629,7 @@ namespace BotBuddyAI
     {
         if (!bot) return false;
         
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
         
         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
@@ -644,7 +644,7 @@ namespace BotBuddyAI
     {
         if (!bot) return false;
         
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
         
         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
@@ -755,7 +755,7 @@ namespace BotBuddyAI
     {
         if (!bot) return false;
 
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) return false;
 
         // Use the bot's AI system to handle looting

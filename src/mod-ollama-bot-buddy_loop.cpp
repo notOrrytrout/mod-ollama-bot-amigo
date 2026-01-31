@@ -861,7 +861,7 @@ std::string GetCombatSummary(Player* bot)
     Unit* victim = bot->GetVictim();
     
     // Get bot's combat characteristics
-    PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+    PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
     bool isMelee = ai ? ai->IsMelee(bot) : false;
     bool isRanged = ai ? ai->IsRanged(bot) : false;
     std::string combatType = isMelee ? "MELEE" : (isRanged ? "RANGED" : "HYBRID");
@@ -1266,7 +1266,7 @@ static std::string QueryOllamaLLM(const std::string& prompt)
 
 static std::string BuildBotPrompt(Player* bot)
 {
-    PlayerbotAI* botAI = sPlayerbotsMgr->GetPlayerbotAI(bot);
+    PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
     if (!botAI) return "";
 
     AreaTableEntry const* botCurrentArea = botAI->GetCurrentArea();
@@ -1672,7 +1672,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 /*diff*/)
         if (botName != "Ollamatest") continue;
 
         // Clear the normal Playerbot AI
-        PlayerbotAI* ai = sPlayerbotsMgr->GetPlayerbotAI(bot);
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (ai)
         {
             ai->ClearStrategies(BOT_STATE_COMBAT);
