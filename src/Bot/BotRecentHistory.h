@@ -22,7 +22,8 @@ class BotRecentHistory
 public:
     enum class MovementTool : uint8_t
     {
-        MoveHop
+        MoveHop,
+        MoveHopNpc
     };
 
     struct MovementAttempt
@@ -117,4 +118,3 @@ private:
     static std::mutex mutex_;
     static std::unordered_map<uint64_t, BotRecentHistory*> byGuid_;
 };
-

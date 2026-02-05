@@ -342,6 +342,7 @@ bool ResolveCapabilityCommand(ControlAction::Capability capability,
             break;
         case ControlAction::Capability::Idle:
         case ControlAction::Capability::MoveHop:
+        case ControlAction::Capability::MoveHopNpc:
         default:
             return false;
     }

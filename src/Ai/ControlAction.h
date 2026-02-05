@@ -21,6 +21,7 @@ struct ControlAction
     {
         Idle,
         MoveHop,
+        MoveHopNpc,
         EnterGrind,
         StopGrind,
         Stay,
@@ -46,6 +47,7 @@ struct ControlAction
     uint32 navEpoch = 0;
     std::string navCandidateId;
     uint32 questId = 0;
+    uint32 npcEntryId = 0;
     std::string professionSkill;
     std::string professionIntent;
 };

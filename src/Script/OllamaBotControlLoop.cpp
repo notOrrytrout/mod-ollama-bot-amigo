@@ -196,6 +196,9 @@ namespace
             float distance = 0.0f;
             bool isQuestGiver = false;
             std::string questMarker;
+            bool isVendor = false;
+            bool isTrainer = false;
+            bool isRepair = false;
         };
         std::vector<NearbyEntity> nearbyEntities;
         struct QuestGiverInRange
@@ -990,6 +993,13 @@ namespace
                 oss << " candidate_id=" << action.navCandidateId;
             }
             break;
+        case ControlAction::Capability::MoveHopNpc:
+            oss << "move_hop_npc";
+            if (action.npcEntryId > 0)
+            {
+                oss << " entry_id=" << action.npcEntryId;
+            }
+            break;
         case ControlAction::Capability::EnterGrind:
             oss << "enter_grind";
             break;
@@ -1123,6 +1133,7 @@ namespace
         bool requiresDirection;
         bool requiresDistance;
         bool requiresQuestId;
+        bool requiresEntryId;
         bool requiresSkill;
         bool requiresIntent;
         bool requiresMessage;
@@ -1130,11 +1141,12 @@ namespace
         bool requiresCandidateId;
     };
 
-    const std::array<ControlToolDefinition, 12> kControlTools = {
+    const std::array<ControlToolDefinition, 13> kControlTools = {
         ControlToolDefinition{
             "request_idle",
             "request_idle()",
             ControlAction::Capability::Idle,
+            false,
             false,
             false,
             false,
@@ -1153,12 +1165,27 @@ namespace
             false,
             false,
             false,
+            false,
             true,
             true},
+        ControlToolDefinition{
+            "request_move_hop_npc",
+            "request_move_hop_npc(entry_id)",
+            ControlAction::Capability::MoveHopNpc,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false},
         ControlToolDefinition{
             "request_enter_grind",
             "request_enter_grind()",
             ControlAction::Capability::EnterGrind,
+            false,
             false,
             false,
             false,
@@ -1178,11 +1205,13 @@ namespace
             false,
             false,
             false,
+            false,
             false},
         ControlToolDefinition{
             "request_stay",
             "request_stay()",
             ControlAction::Capability::Stay,
+            false,
             false,
             false,
             false,
@@ -1202,6 +1231,7 @@ namespace
             false,
             false,
             false,
+            false,
             false},
         ControlToolDefinition{
             "request_talk_to_quest_giver",
@@ -1210,6 +1240,7 @@ namespace
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1226,11 +1257,13 @@ namespace
             false,
             false,
             false,
+            false,
             false},
         ControlToolDefinition{
             "request_profession",
             "request_profession(skill, intent)",
             ControlAction::Capability::UseProfession,
+            false,
             false,
             false,
             false,
@@ -1251,6 +1284,7 @@ namespace
             false,
             false,
             false,
+            false,
             false},
         ControlToolDefinition{
             "request_turn_right_90",
@@ -1263,11 +1297,13 @@ namespace
             false,
             false,
             false,
+            false,
             false},
         ControlToolDefinition{
             "request_turn_around",
             "request_turn_around()",
             ControlAction::Capability::TurnAround,
+            false,
             false,
             false,
             false,
@@ -1550,6 +1586,9 @@ Rules:
         oss << stateToken;
         oss << R"(.nav.nav_epoch.
   Only choose candidates where can_move is true (and preferably reachable is true).
+- request_move_hop_npc: entry_id must match a nearby NPC in )";
+        oss << stateToken;
+        oss << R"(.nearby_entities (type \"npc\"). This moves near the NPC but does not talk.
 - request_talk_to_quest_giver: quest_id must be in )";
         oss << stateToken;
         oss << R"(.quest_givers_in_range entries (available_quest_ids or turn_in_quest_ids).
@@ -1573,6 +1612,11 @@ request_move_hop format:
 {"name":"request_move_hop","arguments":{"nav_epoch":42,"candidate_id":"nav_0"}}
 </tool_call>
 
+request_move_hop_npc format:
+<tool_call>
+{"name":"request_move_hop_npc","arguments":{"entry_id":12345}}
+</tool_call>
+
 request_profession format:
 <tool_call>
 {"name":"request_profession","arguments":{"skill":"fishing","intent":"fish"}}
@@ -1590,6 +1634,8 @@ request_profession format:
             return "idle";
         case ControlAction::Capability::MoveHop:
             return "move_hop";
+        case ControlAction::Capability::MoveHopNpc:
+            return "move_hop_npc";
         case ControlAction::Capability::EnterGrind:
             return "enter_grind";
         case ControlAction::Capability::StopGrind:
@@ -2047,6 +2093,9 @@ request_profession format:
             entity.pos = Position3{creature->GetPositionX(), creature->GetPositionY(), creature->GetPositionZ()};
             entity.distance = bot->GetDistance(creature);
             entity.isQuestGiver = creature->IsQuestGiver();
+            entity.isVendor = creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_VENDOR);
+            entity.isTrainer = creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_TRAINER);
+            entity.isRepair = creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_REPAIR);
             if (entity.isQuestGiver)
             {
                 QuestRelationBounds startBounds = sObjectMgr->GetCreatureQuestRelationBounds(creature->GetEntry());
@@ -2969,6 +3018,9 @@ request_profession format:
                                       {"direction", DirectionLabelFromBearing(bearing)},
                                       {"is_quest_giver", entity.isQuestGiver},
                                       {"quest_marker", entity.questMarker},
+                                      {"is_vendor", entity.isVendor},
+                                      {"is_trainer", entity.isTrainer},
+                                      {"is_repair", entity.isRepair},
                                       {"visible", true}});
         }
         json["nearby_entities"] = nearbyEntities;
@@ -3681,6 +3733,7 @@ You are a control-only executor.
 - Use LT, ST, and S to choose a valid tool.
 - If S.bot.in_combat is true or S.bot.is_moving is true, call request_idle.
 - If S.quest_givers_in_range is not empty, prioritize request_talk_to_quest_giver.
+- If you need to interact with a quest giver/vendor/trainer but none are in range, use request_move_hop_npc(entry_id) to approach a relevant nearby NPC (S.nearby_entities where is_quest_giver/is_vendor/is_trainer/is_repair is true). Do not use it on random NPCs.
 - Otherwise, prefer nearer quest objectives or nearer quest POIs when choosing movement.
 - If no control action is needed, call request_idle.
 )";
@@ -3707,6 +3760,7 @@ You are a control-only executor.
 - If STATE_JSON.bot.is_moving is true, call request_idle unless STATE_JSON.bot.grind_mode is true (in that case you may call request_stop_grind).
 - If STATE_JSON.bot.grind_mode is true and you need to travel/quest/talk, call request_stop_grind.
 - If STATE_JSON.quest_givers_in_range is not empty, prioritize request_talk_to_quest_giver.
+- If you need to interact with a quest giver/vendor/trainer but none are in range, use request_move_hop_npc(entry_id) to approach a relevant nearby NPC (STATE_JSON.nearby_entities where is_quest_giver/is_vendor/is_trainer/is_repair is true). Do not use it on random NPCs.
 - If you intend to talk to a quest giver and your facing does not match its direction, use a turn tool first, then talk.
 - If working on incomplete quest objectives and relevant mobs are nearby, call request_enter_grind.
 - Otherwise, prefer nearer quest objectives or nearer quest POIs when choosing movement.
@@ -3890,6 +3944,38 @@ You are a control-only executor.
         }
 
         return questId != 0;
+    }
+
+    bool ParseEntryIdArguments(nlohmann::json const& args, uint32& entryId)
+    {
+        if (!args.is_object())
+        {
+            return false;
+        }
+        if (!args.contains("entry_id"))
+        {
+            return false;
+        }
+
+        if (args["entry_id"].is_number_unsigned())
+        {
+            entryId = args["entry_id"].get<uint32>();
+        }
+        else if (args["entry_id"].is_number_integer())
+        {
+            int64 parsed = args["entry_id"].get<int64>();
+            if (parsed <= 0 || parsed > std::numeric_limits<uint32>::max())
+            {
+                return false;
+            }
+            entryId = static_cast<uint32>(parsed);
+        }
+        else
+        {
+            return false;
+        }
+
+        return entryId != 0;
     }
 
     void LogControlToolAccepted(std::string const &name, ControlAction::Capability capability, std::string const &reason)
@@ -4148,8 +4234,9 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 size_t nextIndex = (currentIndex + 1) % state.shortTermGoals.size();
                 state.shortTermIndex.store(nextIndex, std::memory_order_relaxed);
             }
-            if (state.lastControlCapability.load(std::memory_order_relaxed) ==
-                static_cast<uint8>(ControlAction::Capability::MoveHop))
+            uint8 lastCap = state.lastControlCapability.load(std::memory_order_relaxed);
+            if (lastCap == static_cast<uint8>(ControlAction::Capability::MoveHop) ||
+                lastCap == static_cast<uint8>(ControlAction::Capability::MoveHopNpc))
             {
                 state.forceControl.store(true, std::memory_order_relaxed);
             }
@@ -4936,7 +5023,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     clearBusy();
                     return;
                 }
-                if (!definition.requiresDirection && !definition.requiresDistance && !definition.requiresQuestId &&
+                if (!definition.requiresDirection && !definition.requiresDistance && !definition.requiresQuestId && !definition.requiresEntryId &&
                     !definition.requiresSkill && !definition.requiresIntent && !definition.requiresMessage &&
                     !definition.requiresNavEpoch && !definition.requiresCandidateId &&
                     !toolCall.arguments.empty())
@@ -5054,6 +5141,103 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     action.navCandidateId = candidateId;
                     accepted = true;
                     gateReason = "out_of_combat";
+                }
+                else if (definition.capability == ControlAction::Capability::MoveHopNpc)
+                {
+                    uint32 entryId = 0;
+                    if (!ParseEntryIdArguments(toolCall.arguments, entryId))
+                    {
+                        LogControlToolRejected(toolCall.name, "invalid_arguments");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    if (snapshot.inCombat)
+                    {
+                        LogControlToolRejected(toolCall.name, "in_combat");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+                    if (snapshot.grindMode)
+                    {
+                        LogControlToolRejected(toolCall.name, "in_grind");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+                    if (snapshot.isMoving)
+                    {
+                        LogControlToolRejected(toolCall.name, "already_moving");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+                    if (snapshot.travelActive)
+                    {
+                        LogControlToolRejected(toolCall.name, "travel_active");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+                    if (snapshot.professionActive)
+                    {
+                        LogControlToolRejected(toolCall.name, "profession_active");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    bool found = false;
+                    bool actionable = false;
+                    for (auto const& e : snapshot.nearbyEntities)
+                    {
+                        if (e.type == "npc" && e.entryId == entryId)
+                        {
+                            found = true;
+                            actionable = e.isQuestGiver || e.isVendor || e.isTrainer || e.isRepair;
+                            break;
+                        }
+                    }
+                    if (!found)
+                    {
+                        for (auto const& g : snapshot.questGiversInRange)
+                        {
+                            if (g.entryId == entryId)
+                            {
+                                found = true;
+                                actionable = true; // quest giver is always actionable
+                                break;
+                            }
+                        }
+                    }
+                    if (!found)
+                    {
+                        LogControlToolRejected(toolCall.name, "npc_not_nearby");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+                    if (!actionable)
+                    {
+                        LogControlToolRejected(toolCall.name, "npc_not_actionable");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    action.npcEntryId = entryId;
+                    accepted = true;
+                    gateReason = "nearby_npc";
                 }
                 else if (definition.capability == ControlAction::Capability::EnterGrind)
                 {
@@ -5304,7 +5488,8 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                         ctx.lastControlAtMs = GetNowMs();
                     }
                     if (shortTermGoalCount > 0 &&
-                        actionState.action.capability != ControlAction::Capability::MoveHop)
+                        actionState.action.capability != ControlAction::Capability::MoveHop &&
+                        actionState.action.capability != ControlAction::Capability::MoveHopNpc)
                     {
                         size_t currentIndex = stateRef->shortTermIndex.load(std::memory_order_relaxed);
                         size_t nextIndex = (currentIndex + 1) % shortTermGoalCount;

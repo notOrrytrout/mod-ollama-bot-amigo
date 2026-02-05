@@ -3,9 +3,9 @@
 const std::string &GetDefaultPlannerPrompt()
 {
     // Default planner system prompt used when config overrides are missing.
-    static const std::string prompt = R"(You are the PLANNER for a World of Warcraft bot.
+    static const std::string prompt = R"(You are the PLANNER for a World of Warcraft WoTLK bot.
 
-Your job is to choose exactly ONE long-term goal that the bot should pursue next.
+Your job is to choose exactly ONE long-term goal that the bot should pursue next. Use LONG_TERM_GOAL and STATE_JSON info.
 
 Rules (strict):
 - Output ONLY a single plain-text sentence.
@@ -48,7 +48,7 @@ Output rules (strict):
 - Do NOT include explanations, steps, or tool names.
 
 Content rules:
-- Make it specific and actionable: name the quest(s), NPC(s), mob(s), or item(s) involved.
+- Make it specific and actionable: name the quest(s),name the NPC(s),name the mob(s), or item(s) involved.
 - If completing an objective requires killing mobs, explicitly say to grind those mobs.
 - If turning in or accepting quests is the best next step, explicitly say to talk to the named quest giver.
 - If travel is required, mention the destination by quest/NPC/objective name (and direction/distance if present in the state summary).
