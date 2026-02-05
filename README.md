@@ -8,6 +8,16 @@
 > NOT FOR GENERAL USE YET -
 > This module is very experimental at the moment and will not work, may break your server and will cause significant CPU load on your server due to LLM-driven bot automation. Use with caution.
 
+## AzerothCore Catalogue (Required Metadata)
+
+- **Name:** mod-ollama-bot-amigo
+- **Description (GitHub repo description):** Experimental AzerothCore module that connects Playerbots to an Ollama LLM for bounded planning + control actions.
+- **Author/Maintainer:** Orry (GitHub: `notOrrytrout`)
+- **Original project/credit:** Forked from the Ollama Buddy bot work by Dustin Hendrickson (GitHub: `DustinHendrickson`) and contributors.
+- **Installation:** See [Installation](#installation) below.
+- **License:** GNU Affero General Public License v3.0 (`AGPL-3.0-only`) — see `LICENSE`.
+- **GitHub Topic(s) for catalogue inclusion:** `azerothcore-module`
+
 ## Overview
 
 ***mod-ollama-bot-amigo*** is an experimental AzerothCore module (forked from Ollama Buddy bot) that connects Playerbots to an Ollama LLM for planning and a bounded set of control actions. The LLM picks a single tool call per tick; the module validates it and maps it to Playerbot commands. Combat tactics remain in PlayerbotAI, and the current focus is controlled movement, grind toggles, quest-giver interaction, and fishing.

@@ -22,8 +22,8 @@ The goal should describe WHAT the bot intends to achieve, not HOW it will be exe
 const std::string &GetDefaultControlPrompt()
 {
     // Default control system prompt used when config overrides are missing.
-    static const std::string prompt = R"(You are the control executor for a World of Warcraft bot.
-Use LONG_TERM_GOAL, SHORT_TERM_GOAL, and STATE_JSON to choose the single best tool call from the allowed tools list.
+    static const std::string prompt = R"(You are the control executor for a World of Warcraft WoTLK bot.
+Use SHORT_TERM_GOAL, and STATE_JSON to choose the single best tool call from the allowed tools list.
 Hints: call request_move_hop with the current STATE_JSON.nav.nav_epoch and a STATE_JSON.nav.candidates[].candidate_id (only choose candidates where can_move is true); call request_talk_to_quest_giver(quest_id) when a relevant quest giver is in range (accept or turn in); call request_enter_grind to fight when completing kill/drop quest objectives or when grinding is appropriate; if STATE_JSON.bot.grind_mode is true but you need to move/quest/talk, call request_stop_grind (allowed even if STATE_JSON.bot.is_moving is true); if blocked or no control action is needed, call request_idle.
 If you intend to talk to a quest giver, ensure you are facing it first; use a turn tool if needed.
 Prioritize talking to quest givers in range when they have available quests or turn-ins; otherwise prefer nearer quest objectives and nearer quest POIs.

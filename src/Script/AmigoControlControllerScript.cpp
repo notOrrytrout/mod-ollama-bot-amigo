@@ -5,6 +5,7 @@
 #include "Ai/OllamaRuntime.h"
 #include "Bot/BotMovement.h"
 #include "Bot/BotNavState.h"
+#include "Bot/BotRecentHistory.h"
 #include "Util/WorldChecks.h"
 #include "ObjectMgr.h"
 #include "GameObject.h"
@@ -430,9 +431,41 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
     if (actionState.action.capability == ControlAction::Capability::MoveHop)
     {
         // Move hops start a stateful, path-based movement.
+        BotRecentHistory* recent = BotRecentHistoryRegistry::Get(guid);
+        auto recordMoveHop = [&](bool accepted,
+                                 std::string reason,
+                                 uint32 navEpoch,
+                                 std::string const& candidateId,
+                                 bool candReachable,
+                                 bool candHasLOS,
+                                 bool candCanMove,
+                                 bool engineReachable,
+                                 bool engineHasLOS)
+        {
+            if (!recent)
+            {
+                return;
+            }
+            BotRecentHistory::MovementAttempt attempt;
+            attempt.atMs = getMSTime();
+            attempt.tool = BotRecentHistory::MovementTool::MoveHop;
+            attempt.accepted = accepted;
+            attempt.reason = std::move(reason);
+            attempt.navEpoch = navEpoch;
+            attempt.candidateId = candidateId;
+            attempt.candReachable = candReachable;
+            attempt.candHasLOS = candHasLOS;
+            attempt.candCanMove = candCanMove;
+            attempt.engineReachable = engineReachable;
+            attempt.engineHasLOS = engineHasLOS;
+            recent->RecordMovementAttempt(std::move(attempt));
+        };
+
         if (!CanMoveNow(snapshot))
         {
             LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop due to grind/moving/combat for {}", player->GetName());
+            recordMoveHop(false, "gated:cannot_move_now", actionState.action.navEpoch, actionState.action.navCandidateId,
+                          false, false, false, false, false);
             return;
         }
 
@@ -446,6 +479,8 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         if (actionState.action.navCandidateId.empty())
         {
             LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop: missing candidate_id for {}", player->GetName());
+            recordMoveHop(false, "invalid:missing_candidate_id", actionState.action.navEpoch, std::string(),
+                          false, false, false, false, false);
             return;
         }
 
@@ -464,6 +499,10 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
                 actionState.action.navEpoch,
                 actionState.action.navCandidateId
             );
+            recordMoveHop(false, "invalid:nav_epoch_or_candidate_mismatch",
+                          actionState.action.navEpoch,
+                          actionState.action.navCandidateId,
+                          false, false, false, false, false);
             return;
         }
 
@@ -476,6 +515,10 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
                 actionState.action.navEpoch,
                 actionState.action.navCandidateId
             );
+            recordMoveHop(false, "candidate:cannot_move",
+                          actionState.action.navEpoch,
+                          actionState.action.navCandidateId,
+                          candReachable, candHasLOS, candCanMove, false, false);
             return;
         }
         if (!candReachable)
@@ -487,6 +530,10 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
                 actionState.action.navEpoch,
                 actionState.action.navCandidateId
             );
+            recordMoveHop(false, "candidate:unreachable",
+                          actionState.action.navEpoch,
+                          actionState.action.navCandidateId,
+                          candReachable, candHasLOS, candCanMove, false, false);
             return;
         }
 
@@ -517,6 +564,10 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         if (travel->Active())
         {
             LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop: travel already active for {}", player->GetName());
+            recordMoveHop(false, "gated:travel_already_active",
+                          actionState.action.navEpoch,
+                          actionState.action.navCandidateId,
+                          candReachable, candHasLOS, candCanMove, false, false);
             return;
         }
 
@@ -532,6 +583,10 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
                 player->GetName(),
                 hasLOS ? "yes" : "no"
             );
+            recordMoveHop(false, "engine:destination_unreachable",
+                          actionState.action.navEpoch,
+                          actionState.action.navCandidateId,
+                          candReachable, candHasLOS, candCanMove, reachable, hasLOS);
             return;
         }
         if (!hasLOS)
@@ -542,8 +597,17 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         if (!movement->StartPathMove(player, dest, MoveReason::Travel))
         {
             LOG_INFO("server.loading", "[OllamaBotAmigo] move_hop path start failed for {}", player->GetName());
+            recordMoveHop(false, "engine:start_path_failed",
+                          actionState.action.navEpoch,
+                          actionState.action.navCandidateId,
+                          candReachable, candHasLOS, candCanMove, reachable, hasLOS);
             return;
         }
+
+        recordMoveHop(true, "accepted",
+                      actionState.action.navEpoch,
+                      actionState.action.navCandidateId,
+                      candReachable, candHasLOS, candCanMove, reachable, hasLOS);
 
         // Record semantic travel target (arrival radius + timeout) for downstream reporting.
         // Timeout is based on the current distance to destination, clamped to prevent indefinite wandering.

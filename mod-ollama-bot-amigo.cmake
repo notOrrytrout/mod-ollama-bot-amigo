@@ -17,6 +17,9 @@ if(TARGET modules)
     # Professions (execution-only)
     target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Bot/BotProfession.cpp)
 
+    # Recent in-memory history (movement outcomes + goal changes/completions)
+    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Bot/BotRecentHistory.cpp)
+
     # Internal nav state (candidate_id -> engine destination)
     target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Bot/BotNavState.cpp)
 
