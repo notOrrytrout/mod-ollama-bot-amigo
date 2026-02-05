@@ -148,6 +148,7 @@ Each control response must be exactly one `<tool_call>` block (no extra text). S
 
 - `request_idle`
 - `request_move_hop` (nav_epoch + candidate_id)
+- `request_move_hop_npc` (entry_id)
 - `request_enter_grind`
 - `request_stop_grind`
 - `request_stay`

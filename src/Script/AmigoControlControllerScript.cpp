@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
 
@@ -74,6 +75,7 @@ namespace
         {
             case ControlAction::Capability::Idle:               return "idle";
             case ControlAction::Capability::MoveHop:            return "move_hop";
+            case ControlAction::Capability::MoveHopNpc:         return "move_hop_npc";
             case ControlAction::Capability::EnterGrind:         return "enter_grind";
             case ControlAction::Capability::StopGrind:          return "stop_grind";
             case ControlAction::Capability::Stay:               return "stay";
@@ -217,6 +219,45 @@ namespace
             if (dist < bestDist)
             {
                 best = go;
+                bestDist = dist;
+            }
+        }
+
+        return best;
+    }
+
+    Creature* FindNearestNpcByEntryId(Player* bot, PlayerbotAI* ai, uint32 entryId)
+    {
+        if (!bot || !ai || entryId == 0)
+        {
+            return nullptr;
+        }
+
+        AiObjectContext* context = ai->GetAiObjectContext();
+        if (!context)
+        {
+            return nullptr;
+        }
+
+        Creature* best = nullptr;
+        float bestDist = std::numeric_limits<float>::max();
+
+        GuidVector npcs = context->GetValue<GuidVector>("nearest npcs")->Get();
+        for (ObjectGuid const& guid : npcs)
+        {
+            Creature* creature = ai->GetCreature(guid);
+            if (!creature)
+            {
+                continue;
+            }
+            if (creature->GetEntry() != entryId)
+            {
+                continue;
+            }
+            float dist = bot->GetDistance(creature);
+            if (dist < bestDist)
+            {
+                best = creature;
                 bestDist = dist;
             }
         }
@@ -425,6 +466,118 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
     if (snapshot.inCombat)
     {
         LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored control action during combat for {}", player->GetName());
+        return;
+    }
+
+    if (actionState.action.capability == ControlAction::Capability::MoveHopNpc)
+    {
+        BotRecentHistory* recent = BotRecentHistoryRegistry::Get(guid);
+        auto recordMoveHopNpc = [&](bool accepted, std::string reason, bool engineReachable, bool engineHasLOS)
+        {
+            if (!recent)
+            {
+                return;
+            }
+            BotRecentHistory::MovementAttempt attempt;
+            attempt.atMs = getMSTime();
+            attempt.tool = BotRecentHistory::MovementTool::MoveHopNpc;
+            attempt.accepted = accepted;
+            attempt.reason = std::move(reason);
+            attempt.navEpoch = 0;
+            attempt.candidateId.clear();
+            attempt.candReachable = false;
+            attempt.candHasLOS = false;
+            attempt.candCanMove = false;
+            attempt.engineReachable = engineReachable;
+            attempt.engineHasLOS = engineHasLOS;
+            recent->RecordMovementAttempt(std::move(attempt));
+        };
+
+        if (!CanMoveNow(snapshot))
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop_npc due to grind/moving/combat for {}", player->GetName());
+            recordMoveHopNpc(false, "gated:cannot_move_now", false, false);
+            return;
+        }
+        if (actionState.action.npcEntryId == 0)
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop_npc: missing entry_id for {}", player->GetName());
+            recordMoveHopNpc(false, "invalid:missing_entry_id", false, false);
+            return;
+        }
+
+        Creature* npc = FindNearestNpcByEntryId(player, ai, actionState.action.npcEntryId);
+        if (!npc)
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop_npc: npc not found nearby for {} (entry_id={})",
+                     player->GetName(),
+                     actionState.action.npcEntryId);
+            recordMoveHopNpc(false, "invalid:npc_not_found_nearby", false, false);
+            return;
+        }
+
+        player->SetSelection(npc->GetGUID());
+
+        BotMovement* movement = BotMovementRegistry::Get(guid);
+        BotTravel* travel = BotTravelRegistry::Get(guid);
+        if (!movement)
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] No movement instance registered for {}", player->GetName());
+            recordMoveHopNpc(false, "engine:no_movement", false, false);
+            return;
+        }
+        if (!travel)
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] No travel instance registered for {}", player->GetName());
+            recordMoveHopNpc(false, "engine:no_travel", false, false);
+            return;
+        }
+        if (travel->Active())
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop_npc: travel already active for {}", player->GetName());
+            recordMoveHopNpc(false, "gated:travel_already_active", false, false);
+            return;
+        }
+
+        WorldPosition dest(npc);
+        constexpr float kNpcApproachOffsetMeters = 1.6f;
+        float ox = npc->GetPositionX() + std::cos(npc->GetOrientation()) * kNpcApproachOffsetMeters;
+        float oy = npc->GetPositionY() + std::sin(npc->GetOrientation()) * kNpcApproachOffsetMeters;
+        WorldPosition offsetDest(npc->GetMapId(), ox, oy, npc->GetPositionZ());
+        if (WorldChecks::CanReach(player, offsetDest))
+        {
+            dest = offsetDest;
+        }
+
+        bool reachable = WorldChecks::CanReach(player, dest);
+        bool hasLOS = WorldChecks::IsWithinLOS(player, dest);
+        if (!reachable)
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop_npc: destination not reachable for {} (entry_id={}, los={})",
+                     player->GetName(),
+                     actionState.action.npcEntryId,
+                     hasLOS ? "yes" : "no");
+            recordMoveHopNpc(false, "engine:destination_unreachable", reachable, hasLOS);
+            return;
+        }
+
+        if (!movement->StartPathMove(player, dest, MoveReason::Travel))
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] move_hop_npc path start failed for {} (entry_id={})", player->GetName(), actionState.action.npcEntryId);
+            recordMoveHopNpc(false, "engine:start_path_failed", reachable, hasLOS);
+            return;
+        }
+
+        recordMoveHopNpc(true, "accepted", reachable, hasLOS);
+
+        uint32 nowMs = getMSTime();
+        float dist = WorldPosition(player).distance(dest);
+        float capped = std::min(dist, kMaxMoveDistanceCap);
+        uint32 timeoutMs = static_cast<uint32>(std::clamp(capped * 1800.0f, 30000.0f, 180000.0f));
+        std::ostringstream travelKey;
+        travelKey << "move_hop_npc:entry:" << actionState.action.npcEntryId;
+        AmigoTravelTarget targetSpec{travelKey.str(), dest, 2.5f, timeoutMs};
+        travel->Begin(targetSpec, nowMs);
         return;
     }
 

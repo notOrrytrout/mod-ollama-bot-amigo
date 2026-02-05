@@ -133,6 +133,8 @@ const char* BotRecentHistory::MovementToolName(MovementTool tool)
     {
     case MovementTool::MoveHop:
         return "move_hop";
+    case MovementTool::MoveHopNpc:
+        return "move_hop_npc";
     default:
         return "unknown";
     }
@@ -179,4 +181,3 @@ BotRecentHistory* BotRecentHistoryRegistry::Get(uint64_t guid)
     auto it = byGuid_.find(guid);
     return it == byGuid_.end() ? nullptr : it->second;
 }
-
