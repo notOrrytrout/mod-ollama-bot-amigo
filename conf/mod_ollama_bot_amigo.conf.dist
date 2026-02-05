@@ -1,0 +1,89 @@
+[worldserver]
+
+# mod-ollama-bot-amigo configuration (concise)
+# See README.md for detailed descriptions of each option.
+#
+# Precedence (highest → lowest):
+#   1) Environment variables (AC_*)
+#   2) Values in this config file
+#   3) Built-in defaults
+
+
+############################
+# Core
+############################
+OllamaBotControl.BotName = Ollamatest
+OllamaBotControl.Enable = 1
+OllamaBotControl.Url = http://localhost:11434/api/generate
+
+
+############################
+# Timing (milliseconds)
+############################
+OllamaBotControl.DelayMs.Control = 15000
+OllamaBotControl.DelayMs.LTG     = 30000
+OllamaBotControl.DelayMs.STG     = 15000
+OllamaBotControl.DelayMs.Startup = 15000
+
+
+############################
+# Models
+############################
+OllamaBotControl.Model.Control          = ministral-3:3b
+OllamaBotControl.Model.Planner          = ministral-3:3b
+OllamaBotControl.Model.PlannerLongTerm  =
+OllamaBotControl.Model.PlannerShortTerm =
+
+
+############################
+# Roles
+############################
+OllamaBotControl.Control.Enable = 1
+OllamaBotControl.Planner.Enable = 1
+
+
+############################
+# Behavior
+############################
+OllamaBotControl.ClearGoalsOnConfigLoad = 0
+OllamaBotControl.Planner.ForcedLongTermGoal =
+OllamaBotControl.QuestingOnly = 0
+
+
+############################
+# Memory (CharacterDatabase)
+############################
+OllamaBotControl.EnablePlannerMemory = 1
+OllamaBotControl.EnableStuckMemory  = 1
+OllamaBotControl.EnableVendorMemory = 1
+
+
+############################
+# Logging
+############################
+OllamaBotControl.Control.Debug = 0
+OllamaBotControl.Debug = 0
+OllamaBotControl.Planner.Debug = 0
+OllamaBotControl.PromptFormat = debug
+
+OllamaBotControl.Planner.StateSummaryLog.Enable = 0
+OllamaBotControl.Planner.StateSummaryLog.Path = ollama_planner_state_summary.log
+
+
+############################
+# Navigation
+############################
+OllamaBotControl.Nav.BaseDistance = 6
+OllamaBotControl.Nav.DistanceBands = 3
+OllamaBotControl.Nav.DistanceMultiplier = 2
+OllamaBotControl.Nav.MaxDistance = 60
+
+
+############################
+# System Prompts (optional)
+############################
+# Empty = built-in defaults.
+# Use \n to embed multi-line prompts.
+OllamaBotControl.SystemPrompt.Control =
+OllamaBotControl.SystemPrompt.Planner =
+OllamaBotControl.SystemPrompt.ShortTerm =
