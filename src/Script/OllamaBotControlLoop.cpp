@@ -18,6 +18,7 @@
 #include "Errors.h"
 #include "Ai/OllamaRuntime.h"
 #include "Bot/BotMovement.h"
+#include "Bot/BotRecentHistory.h"
 #include "Util/WorldChecks.h"
 #include "Db/BotMemory.h"
 #include "Bot/BotTravel.h"
@@ -99,6 +100,7 @@ namespace
     struct BotSnapshot
     {
         // Condensed view of bot/world state sent to the LLM.
+        uint32 nowMs = 0;
         Position3 pos;
         float orientation = 0.0f;
         uint32 mapId = 0;
@@ -211,6 +213,13 @@ namespace
             std::vector<uint32> turnInActiveQuestIds;
         };
         std::vector<QuestGiverInRange> questGiversInRange;
+
+        // Recent outcomes to help the LLM adapt quickly (in-memory, size-limited).
+        std::vector<BotRecentHistory::MovementAttempt> recentMovementAttempts;
+        std::vector<BotRecentHistory::MovementResult> recentMovementResults;
+        std::vector<BotRecentHistory::LongTermGoalChange> recentLongTermGoalChanges;
+        std::vector<BotRecentHistory::ShortTermGoalsChange> recentShortTermGoalsChanges;
+        std::vector<BotRecentHistory::ShortTermGoalCompletion> recentShortTermGoalCompletions;
     };
 
     struct WorldSnapshot
@@ -2967,6 +2976,93 @@ request_profession format:
         {
             json["current_goal"] = goal->ToJson();
         }
+
+        auto ageMs = [&](uint32 at) -> uint32
+        {
+            if (bot.nowMs == 0 || at == 0)
+                return 0;
+            return (bot.nowMs >= at) ? (bot.nowMs - at) : 0;
+        };
+
+        nlohmann::json recent;
+        if (!bot.recentMovementAttempts.empty())
+        {
+            nlohmann::json arr = nlohmann::json::array();
+            for (auto const& e : bot.recentMovementAttempts)
+            {
+                arr.push_back({
+                    {"age_ms", ageMs(e.atMs)},
+                    {"tool", BotRecentHistory::MovementToolName(e.tool)},
+                    {"accepted", e.accepted},
+                    {"reason", e.reason},
+                    {"nav_epoch", e.navEpoch},
+                    {"candidate_id", e.candidateId},
+                    {"cand_reachable", e.candReachable},
+                    {"cand_has_los", e.candHasLOS},
+                    {"cand_can_move", e.candCanMove},
+                    {"engine_reachable", e.engineReachable},
+                    {"engine_has_los", e.engineHasLOS},
+                });
+            }
+            recent["movement_attempts"] = std::move(arr);
+        }
+        if (!bot.recentMovementResults.empty())
+        {
+            nlohmann::json arr = nlohmann::json::array();
+            for (auto const& e : bot.recentMovementResults)
+            {
+                arr.push_back({
+                    {"age_ms", ageMs(e.atMs)},
+                    {"travel_key", e.travelKey},
+                    {"result", e.result},
+                });
+            }
+            recent["movement_results"] = std::move(arr);
+        }
+        if (!bot.recentLongTermGoalChanges.empty())
+        {
+            nlohmann::json arr = nlohmann::json::array();
+            for (auto const& e : bot.recentLongTermGoalChanges)
+            {
+                arr.push_back({
+                    {"age_ms", ageMs(e.atMs)},
+                    {"from", e.from},
+                    {"to", e.to},
+                });
+            }
+            recent["long_term_goal_changes"] = std::move(arr);
+        }
+        if (!bot.recentShortTermGoalsChanges.empty())
+        {
+            nlohmann::json arr = nlohmann::json::array();
+            for (auto const& e : bot.recentShortTermGoalsChanges)
+            {
+                arr.push_back({
+                    {"age_ms", ageMs(e.atMs)},
+                    {"long_term_goal", e.longTermGoal},
+                    {"goals", e.goals},
+                });
+            }
+            recent["short_term_goal_changes"] = std::move(arr);
+        }
+        if (!bot.recentShortTermGoalCompletions.empty())
+        {
+            nlohmann::json arr = nlohmann::json::array();
+            for (auto const& e : bot.recentShortTermGoalCompletions)
+            {
+                arr.push_back({
+                    {"age_ms", ageMs(e.atMs)},
+                    {"goal", e.goal},
+                    {"travel_key", e.travelKey},
+                });
+            }
+            recent["short_term_goal_completions"] = std::move(arr);
+        }
+
+        if (!recent.empty())
+        {
+            json["recent"] = std::move(recent);
+        }
         return json;
     }
 
@@ -3025,6 +3121,63 @@ request_profession format:
             oss << " (fishing)";
         }
         oss << ".\n";
+
+        auto ageMs = [&](uint32 at) -> uint32
+        {
+            if (bot.nowMs == 0 || at == 0)
+                return 0;
+            return (bot.nowMs >= at) ? (bot.nowMs - at) : 0;
+        };
+
+        bool hasRecent = !bot.recentMovementAttempts.empty() ||
+                         !bot.recentMovementResults.empty() ||
+                         !bot.recentShortTermGoalCompletions.empty();
+        if (hasRecent)
+        {
+            oss << "Recent: ";
+            bool first = true;
+
+            // Movement attempts (recent failures).
+            uint32 failuresShown = 0;
+            for (auto it = bot.recentMovementAttempts.rbegin(); it != bot.recentMovementAttempts.rend() && failuresShown < 3; ++it)
+            {
+                if (it->accepted)
+                    continue;
+                if (!first)
+                    oss << " | ";
+                first = false;
+                ++failuresShown;
+                oss << "move rejected (" << it->reason << ", " << ageMs(it->atMs) / 1000 << "s ago)";
+            }
+
+            // Travel outcomes (timeouts/aborts).
+            uint32 resultsShown = 0;
+            for (auto it = bot.recentMovementResults.rbegin(); it != bot.recentMovementResults.rend() && resultsShown < 2; ++it)
+            {
+                if (it->result == "reached")
+                    continue;
+                if (!first)
+                    oss << " | ";
+                first = false;
+                ++resultsShown;
+                oss << "travel " << it->result << " (" << ageMs(it->atMs) / 1000 << "s ago)";
+            }
+
+            // Short-term completions.
+            uint32 goalsShown = 0;
+            for (auto it = bot.recentShortTermGoalCompletions.rbegin(); it != bot.recentShortTermGoalCompletions.rend() && goalsShown < 2; ++it)
+            {
+                if (it->goal.empty())
+                    continue;
+                if (!first)
+                    oss << " | ";
+                first = false;
+                ++goalsShown;
+                oss << "completed ST goal (" << ageMs(it->atMs) / 1000 << "s ago): " << it->goal;
+            }
+
+            oss << ".\n";
+        }
 
         oss << "Weapons: ";
         if (!bot.weaponTypes.empty())
@@ -3765,6 +3918,10 @@ You are a control-only executor.
         };
 
         ThinkScheduler scheduler;
+        // Tracks the per-bot startup delay window and ensures we force a planner refresh
+        // exactly once when the delay expires.
+        uint32 startupDelayUntilMs = 0;
+        bool startupPlannerTriggered = false;
         std::string longTermGoal;
         std::vector<std::string> shortTermGoals;
         std::atomic<size_t> shortTermIndex{0};
@@ -3802,6 +3959,9 @@ You are a control-only executor.
 
         // Professions (execution-only) such as fishing.
         BotProfession profession;
+
+        // Short recent buffers for movement outcomes and goal transitions.
+        BotRecentHistory recentHistory;
 
         // Guard to record travel outcomes into memory once.
         uint32 lastTravelRecordedMs = 0;
@@ -3930,16 +4090,22 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             BotTravelRegistry::Register(guid, &statePtr->travel);
             BotMemoryRegistry::Register(guid, &statePtr->memory);
             BotProfessionRegistry::Register(guid, &statePtr->profession);
+            BotRecentHistoryRegistry::Register(guid, &statePtr->recentHistory);
             statePtr->memory.Initialize(guid, nowMs);
+
+            uint32 delayUntilMs = nowMs;
             if (g_OllamaBotRuntime.control_startup_delay_ms > 0)
             {
-                uint32 delayUntilMs = nowMs + static_cast<uint32>(g_OllamaBotRuntime.control_startup_delay_ms);
+                delayUntilMs = nowMs + static_cast<uint32>(g_OllamaBotRuntime.control_startup_delay_ms);
                 statePtr->controlState.store(LlmBotState::ControlState::Cooldown, std::memory_order_relaxed);
                 statePtr->nextAllowedAttemptMs.store(delayUntilMs, std::memory_order_relaxed);
-                statePtr->nextPlannerShortTickMs.store(delayUntilMs, std::memory_order_relaxed);
-                statePtr->nextPlannerLongTickMs.store(delayUntilMs, std::memory_order_relaxed);
-                statePtr->nextStrategicAllowedMs.store(delayUntilMs, std::memory_order_relaxed);
             }
+
+            statePtr->startupDelayUntilMs = delayUntilMs;
+            statePtr->startupPlannerTriggered = false;
+            statePtr->nextPlannerShortTickMs.store(delayUntilMs, std::memory_order_relaxed);
+            statePtr->nextPlannerLongTickMs.store(delayUntilMs, std::memory_order_relaxed);
+            statePtr->nextStrategicAllowedMs.store(delayUntilMs, std::memory_order_relaxed);
         }
         LlmBotState &state = *statePtr;
 
@@ -3956,6 +4122,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             state.lastGoalChangeMs = 0;
             state.loggedStrategicParseError.store(false, std::memory_order_relaxed);
             state.loggedControlParseError.store(false, std::memory_order_relaxed);
+            state.recentHistory.ClearGoalHistory();
         }
 
         // Tick professions (non-combat execution). Uses Playerbots actions but no movement.
@@ -3968,6 +4135,16 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             if (!state.shortTermGoals.empty())
             {
                 size_t currentIndex = state.shortTermIndex.load(std::memory_order_relaxed);
+                std::string completed = CurrentShortTermGoal(state.shortTermGoals, currentIndex);
+                if (!completed.empty())
+                {
+                    std::string travelKey;
+                    if (auto cur = state.travel.Current())
+                    {
+                        travelKey = cur->key;
+                    }
+                    state.recentHistory.RecordShortTermGoalCompleted(nowMs, std::move(completed), std::move(travelKey));
+                }
                 size_t nextIndex = (currentIndex + 1) % state.shortTermGoals.size();
                 state.shortTermIndex.store(nextIndex, std::memory_order_relaxed);
             }
@@ -3990,6 +4167,31 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             {
                 if (!cur->key.empty())
                     key = "travel:" + cur->key;
+            }
+
+            {
+                std::string travelKey;
+                if (auto cur = state.travel.Current())
+                {
+                    travelKey = cur->key;
+                }
+                std::string result;
+                switch (state.travel.LastResult())
+                {
+                case TravelResult::Reached:
+                    result = "reached";
+                    break;
+                case TravelResult::TimedOut:
+                    result = "timed_out";
+                    break;
+                case TravelResult::Aborted:
+                    result = "aborted";
+                    break;
+                default:
+                    result = "unknown";
+                    break;
+                }
+                state.recentHistory.RecordMovementResult(nowMs, std::move(travelKey), std::move(result));
             }
 
             switch (state.travel.LastResult())
@@ -4090,6 +4292,20 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 continue;
             }
             state.controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+            controlState = LlmBotState::ControlState::Idle;
+        }
+
+        // When the startup delay expires, force a long-term planner refresh immediately
+        // (once per bot state lifetime). This ensures the bot has a long-term goal as
+        // soon as it becomes eligible to run.
+        if (!state.startupPlannerTriggered && state.startupDelayUntilMs > 0 && nowMs >= state.startupDelayUntilMs)
+        {
+            state.startupPlannerTriggered = true;
+            state.forceStrategic.store(true, std::memory_order_relaxed);
+            state.nextPlannerShortTickMs.store(nowMs, std::memory_order_relaxed);
+            state.nextPlannerLongTickMs.store(nowMs, std::memory_order_relaxed);
+            state.nextStrategicAllowedMs.store(0u, std::memory_order_relaxed);
+            state.hasStrategicResult = false;
         }
 
         uint32 nextShortTick = state.nextPlannerShortTickMs.load(std::memory_order_relaxed);
@@ -4156,6 +4372,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             continue;
         }
         BotSnapshot snapshot = BuildBotSnapshot(bot, ai);
+        snapshot.nowMs = nowMs;
         // Publish internal navigation candidates for controller resolution (not serialized to the LLM).
         {
             BotNavState navState;
@@ -4199,6 +4416,12 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
         uint32 nextAllowed = state.nextAllowedAttemptMs.load(std::memory_order_relaxed);
         snapshot.controlCooldownRemainingMs = (nowMs < nextAllowed) ? (nextAllowed - nowMs) : 0;
         snapshot.controlOllamaBackoffMs = state.ollamaCooldownMs.load(std::memory_order_relaxed);
+
+        snapshot.recentMovementAttempts = state.recentHistory.GetMovementAttempts(8);
+        snapshot.recentMovementResults = state.recentHistory.GetMovementResults(6);
+        snapshot.recentLongTermGoalChanges = state.recentHistory.GetLongTermGoalChanges(4);
+        snapshot.recentShortTermGoalsChanges = state.recentHistory.GetShortTermGoalsChanges(4);
+        snapshot.recentShortTermGoalCompletions = state.recentHistory.GetShortTermGoalCompletions(6);
         WorldSnapshot world = BuildWorldSnapshot(bot);
         bool isIdleCandidate = !snapshot.inCombat && !snapshot.isMoving;
         if (isIdleCandidate)
@@ -4244,6 +4467,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
 
         if (hasStrategicUpdate && strategicUpdate.hasUpdate)
         {
+            std::string previousLongTermGoalForHistory = state.longTermGoal;
             bool hasLongTermGoal = !state.longTermGoal.empty();
             bool canGenerateGoal = true;
 
@@ -4265,6 +4489,11 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                         state.shortTermGoals = std::move(strategicUpdate.plan.shortTermGoals);
                     }
                     state.lastGoalChangeMs = nowMs;
+                    state.recentHistory.RecordLongTermGoalChange(nowMs, previousLongTermGoalForHistory, state.longTermGoal);
+                    if (strategicUpdate.refreshedShortTermGoals)
+                    {
+                        state.recentHistory.RecordShortTermGoalsChange(nowMs, state.longTermGoal, state.shortTermGoals);
+                    }
                     LOG_INFO("server.loading", "[OllamaBotAmigo] Long-term goal updated for {}: {}", bot->GetName(), state.longTermGoal);
                     state.nextStrategicAllowedMs.store(nowMs + kStrategicGoalChangeCooldownMs, std::memory_order_relaxed);
                 }
@@ -4279,6 +4508,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 state.shortTermGoals = std::move(strategicUpdate.plan.shortTermGoals);
                 state.shortTermIndex.store(0, std::memory_order_relaxed);
                 state.lastGoalChangeMs = nowMs;
+                state.recentHistory.RecordShortTermGoalsChange(nowMs, state.longTermGoal, state.shortTermGoals);
                 LOG_INFO("server.loading", "[OllamaBotAmigo] Short-term goals refreshed for {}", bot->GetName());
                 state.nextStrategicAllowedMs.store(nowMs + kStrategicGoalChangeCooldownMs, std::memory_order_relaxed);
             }
