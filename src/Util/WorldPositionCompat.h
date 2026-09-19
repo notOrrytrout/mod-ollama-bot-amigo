@@ -1,10 +1,6 @@
 #pragma once
-#include "Util/PlayerbotsCompat.h"
+
+// Playerbots owns WorldPosition in TravelMgr.h. Keep this compatibility
+// header intentionally small so callers do not inherit unrelated headers or
+// create circular include dependencies.
 #include "TravelMgr.h"
-#include "Entities/Object/Object.h"
-#include "Util/WorldChecks.h"
-
-#include "Log.h"
-#include "PathGenerator.h"
-
-#include <cmath>

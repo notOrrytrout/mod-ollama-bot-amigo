@@ -14,7 +14,59 @@
 ############################
 OllamaBotControl.BotName = Ollamatest
 OllamaBotControl.Enable = 1
+# Provider: ollama or omlx
+# Ollama default endpoint: http://localhost:11434/api/generate
+# oMLX default endpoint:   http://localhost:8000/v1/chat/completions
+OllamaBotControl.Llm.Provider = ollama
+OllamaBotControl.Llm.ApiKey =
 OllamaBotControl.Url = http://localhost:11434/api/generate
+
+# Mock overlay for deterministic end-to-end testing.
+# When enabled, no HTTP request is made. The normal worker pool, planner,
+# control parser, chat path, completion queue, lifecycle, and Playerbots code
+# still run; only the LLM response is spoofed.
+OllamaBotControl.Llm.Mock.Enable = 0
+# Artificial worker-side latency to exercise asynchronous scheduling/backpressure.
+OllamaBotControl.Llm.Mock.LatencyMs = 25
+# Inject one failed request every N mock calls. 0 = never fail.
+OllamaBotControl.Llm.Mock.FailEvery = 0
+# Amigo constructs the canonical <tool_call> JSON block internally.
+OllamaBotControl.Llm.Mock.ControlTool = auto
+
+# JSON object passed as the tool's "arguments". These arguments still go
+# through the real control validator, so stale/nonexistent IDs are rejected.
+#
+# Examples:
+#   request_idle                         -> {}
+#   request_turn_left_90                 -> {}
+#   request_attack_target                -> {"entry_id":829}
+#   request_gather_target                -> {"entry_id":1731}
+#   request_talk_to_quest_giver          -> {"quest_id":33}
+#   request_move_hop                     -> {"nav_epoch":7,"candidate_id":"nav_0"}
+#   request_move_hop_npc                 -> {"entry_id":12345}
+#   request_profession                   -> {"skill":"fishing","intent":"fish"}
+OllamaBotControl.Llm.Mock.ControlArguments =
+OllamaBotControl.Llm.Mock.PlannerLongTermResponse = Continue pursuing the current mission using nearby valid objectives.
+OllamaBotControl.Llm.Mock.PlannerShortTermResponse = Advance the nearest valid objective for the current mission.
+OllamaBotControl.Llm.Mock.ChatResponse = Sounds good.
+OllamaBotControl.Llm.Mock.DefaultResponse = OK
+
+# Keep the configured Amigo character online through Playerbots even when no
+# real player from that account is logged in.
+OllamaBotControl.Bot.AutoLogin = 1
+OllamaBotControl.Bot.AutoLoginDelayMs = 10000
+OllamaBotControl.Bot.AutoLoginRetryMs = 30000
+
+
+############################
+# Group Authority
+############################
+# peer (default): group members and group leader are peers, not owners.
+# Explicit "follow me" / "assist me" requests create temporary directives.
+# playerbots: legacy Playerbots master behavior (group leader/player may become master).
+OllamaBotControl.Group.Authority = peer
+# Duration of an accepted temporary follow/assist request.
+OllamaBotControl.Group.DirectiveTtlMs = 120000
 
 
 ############################
@@ -48,6 +100,14 @@ OllamaBotControl.Planner.Enable = 1
 OllamaBotControl.ClearGoalsOnConfigLoad = 0
 OllamaBotControl.Planner.ForcedLongTermGoal =
 OllamaBotControl.QuestingOnly = 0
+
+# Typed mission assignment.
+# Kind: quest, gather, grind, pvp_bg, party, raid, goal
+# Target: exact resource/mob name for gather/grind, or objective text for goal.
+# Role: optional party/raid role (for future group-role execution).
+OllamaBotControl.Mission.Kind = quest
+OllamaBotControl.Mission.Target =
+OllamaBotControl.Mission.Role =
 
 
 ############################
@@ -87,3 +147,38 @@ OllamaBotControl.Nav.MaxDistance = 60
 OllamaBotControl.SystemPrompt.Control =
 OllamaBotControl.SystemPrompt.Planner =
 OllamaBotControl.SystemPrompt.ShortTerm =
+
+############################
+# LLM Dispatch / Think Mode
+############################
+# Fixed worker pool. Requests beyond MaxQueueDepth are dropped instead of
+# accumulating stale work.
+OllamaBotControl.Llm.WorkerThreads = 2
+OllamaBotControl.Llm.MaxQueueDepth = 32
+OllamaBotControl.Llm.Think.Planner = 1
+OllamaBotControl.Llm.Think.Control = 0
+OllamaBotControl.Llm.Think.MaxLatencyMs = 8000
+
+############################
+# Personality / Chat
+############################
+# Chat is separate from gameplay control. It never exposes BotControlApi tools.
+OllamaBotControl.Chat.Enable = 0
+OllamaBotControl.Chat.PartyOnly = 1
+OllamaBotControl.Chat.HistorySize = 8
+# Comma-separated prefixes ignored as commands rather than conversation.
+OllamaBotControl.Chat.CommandPrefixes = .,!,/,#
+OllamaBotControl.Chat.EventChatter.Enable = 0
+OllamaBotControl.Chat.EventChatter.CooldownMs = 60000
+OllamaBotControl.Personality.Enable = 0
+OllamaBotControl.Personality.Name = default
+OllamaBotControl.Personality.Prompt =
+
+
+# Mock argument syntax:
+# Strict JSON is accepted, but key=value is recommended because config parsing
+# can strip JSON quotes.
+#
+# Examples:
+# OllamaBotControl.Llm.Mock.ControlArguments = entry_id=705
+# OllamaBotControl.Llm.Mock.ControlArguments = nav_epoch=7,candidate_id=nav_0

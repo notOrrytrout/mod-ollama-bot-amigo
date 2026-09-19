@@ -28,14 +28,11 @@ from typing import Any, Dict, List, Optional
 
 DISTANCE_BANDS = ["very close", "close", "medium", "medium far", "far"]
 
-
 def now_iso() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
-
 def now_short() -> str:
     return time.strftime("%H:%M:%S", time.localtime())
-
 
 class ConsoleUI:
     def __init__(self, max_logs: int = 1000) -> None:
@@ -204,14 +201,12 @@ class ConsoleUI:
             return line[:width]
         return line[: max(0, width - 3)] + "..."
 
-
 @dataclass
 class RequestRecord:
     ts: float
     role: str
     model: str
     prompt: str
-
 
 @dataclass
 class StubState:
@@ -323,7 +318,6 @@ class StubState:
             return self.consume_long_term_goal()
         return self.consume_long_term_goal()
 
-
 def classify_role(prompt: str, model: str) -> str:
     token = f"{model} {prompt}".lower()
     if "tool_call" in token or "<tool_call>" in token:
@@ -332,10 +326,8 @@ def classify_role(prompt: str, model: str) -> str:
         return "planner"
     return "unknown"
 
-
 def format_tool_call(name: str, arguments: Dict[str, Any]) -> str:
     return "<tool_call>\n" + json.dumps({"name": name, "arguments": arguments}) + "\n</tool_call>"
-
 
 class StubHandler(BaseHTTPRequestHandler):
     state: StubState
@@ -422,14 +414,12 @@ class StubHandler(BaseHTTPRequestHandler):
     def log_message(self, *_: Any) -> None:
         return
 
-
 def run_server(state: StubState, ui: ConsoleUI, host: str, port: int) -> ThreadingHTTPServer:
     handler = type("InjectedHandler", (StubHandler,), {"state": state, "ui": ui})
     httpd = ThreadingHTTPServer((host, port), handler)
     thread = threading.Thread(target=httpd.serve_forever, name="ollama-stub-server", daemon=True)
     thread.start()
     return httpd
-
 
 def _parse_json_maybe(text: str) -> Dict[str, Any]:
     text = text.strip()
@@ -442,7 +432,6 @@ def _parse_json_maybe(text: str) -> Dict[str, Any]:
         raise ValueError("JSON must be an object")
     except Exception as exc:
         raise ValueError(f"invalid JSON: {exc}") from exc
-
 
 def show_status(state: StubState) -> List[str]:
     with state.lock:
@@ -468,7 +457,6 @@ def show_status(state: StubState) -> List[str]:
             lines.append(f"last_response_len:  {len(state.last_response_text)}")
         return lines
 
-
 def show_history(state: StubState, n: int = 10) -> List[str]:
     with state.lock:
         items = state.history[-n:]
@@ -480,7 +468,6 @@ def show_history(state: StubState, n: int = 10) -> List[str]:
         preview = rec.prompt.replace("\n", " ")[:120]
         lines.append(f"{i:02d}. [{ts}] role={rec.role} model={rec.model} prompt='{preview}'")
     return lines
-
 
 def help_text() -> str:
     return """
@@ -509,7 +496,6 @@ Knobs (legacy):
   epoch <n>
   quest <id>
 """.strip()
-
 
 def console_loop(state: StubState, ui: ConsoleUI) -> None:
     if ui.plain:
@@ -717,7 +703,6 @@ def console_loop(state: StubState, ui: ConsoleUI) -> None:
         except Exception as exc:
             ui.log(f"error: {exc}")
 
-
 def prompt_for_port(default_port: int) -> int:
     while True:
         raw = input(f"Port to bind [default {default_port}]: ").strip()
@@ -728,7 +713,6 @@ def prompt_for_port(default_port: int) -> int:
             if 1 <= port <= 65535:
                 return port
         print("Please enter a valid port between 1 and 65535.", flush=True)
-
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Ollama stub server with a sidebar UI.")
@@ -763,7 +747,6 @@ def main() -> None:
     finally:
         ui.log("shutting down server...")
         httpd.shutdown()
-
 
 if __name__ == "__main__":
     main()

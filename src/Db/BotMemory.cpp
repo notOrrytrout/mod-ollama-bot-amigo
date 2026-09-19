@@ -298,10 +298,10 @@ void BotMemory::UpsertVendor(uint32_t npcEntry,
     entry.record.npcName = std::move(npcName);
     entry.record.role = std::move(role);
     entry.record.zone = zone;
-    entry.record.mapId = posCopy.getMapId();
-    entry.record.x = posCopy.getX();
-    entry.record.y = posCopy.getY();
-    entry.record.z = posCopy.getZ();
+    entry.record.mapId = posCopy.GetMapId();
+    entry.record.x = posCopy.GetPositionX();
+    entry.record.y = posCopy.GetPositionY();
+    entry.record.z = posCopy.GetPositionZ();
     entry.record.lastUsedMs = nowMs;
     entry.dirty = true;
     vendorsDirty_ = true;

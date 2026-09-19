@@ -127,7 +127,7 @@ std::vector<BotRecentHistory::ShortTermGoalCompletion> BotRecentHistory::GetShor
     return TailCopy(shortTermGoalCompletions_, max);
 }
 
-const char* BotRecentHistory::MovementToolName(MovementTool tool)
+char const* BotRecentHistory::MovementToolName(MovementTool tool)
 {
     switch (tool)
     {

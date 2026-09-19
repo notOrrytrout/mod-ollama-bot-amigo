@@ -24,12 +24,12 @@ namespace WorldChecks
         // Playerbots WorldPosition is not const-correct
         WorldPosition posCopy = pos;
 
-        if (bot->GetMapId() != posCopy.getMapId())
+        if (bot->GetMapId() != posCopy.GetMapId())
             return false;
 
-        return bot->IsWithinLOS(posCopy.getX(),
-                                posCopy.getY(),
-                                posCopy.getZ());
+        return bot->IsWithinLOS(posCopy.GetPositionX(),
+                                posCopy.GetPositionY(),
+                                posCopy.GetPositionZ());
     }
 
     float GroundDistance(Player* bot, WorldPosition const& pos)
@@ -39,11 +39,11 @@ namespace WorldChecks
 
         WorldPosition posCopy = pos;
 
-        if (bot->GetMapId() != posCopy.getMapId())
+        if (bot->GetMapId() != posCopy.GetMapId())
             return 0.0f;
 
-        float dx = bot->GetPositionX() - posCopy.getX();
-        float dy = bot->GetPositionY() - posCopy.getY();
+        float dx = bot->GetPositionX() - posCopy.GetPositionX();
+        float dy = bot->GetPositionY() - posCopy.GetPositionY();
         return std::sqrt(dx * dx + dy * dy);
     }
 
@@ -54,16 +54,16 @@ namespace WorldChecks
 
         WorldPosition posCopy = pos;
 
-        if (bot->GetMapId() != posCopy.getMapId())
+        if (bot->GetMapId() != posCopy.GetMapId())
             return false;
 
         PathGenerator pathGen(bot);
         // Playerbots explicitly disables straight-line shortcuts.
         pathGen.SetUseStraightPath(false);
 
-        if (!pathGen.CalculatePath(posCopy.getX(),
-                                   posCopy.getY(),
-                                   posCopy.getZ()))
+        if (!pathGen.CalculatePath(posCopy.GetPositionX(),
+                                   posCopy.GetPositionY(),
+                                   posCopy.GetPositionZ()))
             return false;
 
         Movement::PointsArray const& pts = pathGen.GetPath();
@@ -71,8 +71,8 @@ namespace WorldChecks
             return false;
 
         auto const& last = pts.back();
-        float dx = last.x - posCopy.getX();
-        float dy = last.y - posCopy.getY();
+        float dx = last.x - posCopy.GetPositionX();
+        float dy = last.y - posCopy.GetPositionY();
         float dist2d = std::sqrt(dx * dx + dy * dy);
 
         // If the path ends close enough to the destination, treat it as reachable.

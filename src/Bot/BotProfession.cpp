@@ -121,7 +121,7 @@ void BotProfession::Update(Player* bot, PlayerbotAI* ai, uint32_t nowMs)
     }
 }
 
-void BotProfession::Abort(Player* bot, PlayerbotAI* ai, uint32_t nowMs)
+void BotProfession::Abort(Player*, PlayerbotAI* ai, uint32_t nowMs)
 {
     if (!active_)
         return;

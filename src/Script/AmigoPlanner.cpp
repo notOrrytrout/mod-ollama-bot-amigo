@@ -1,5 +1,8 @@
 #include "Script/AmigoPlanner.h"
 #include "Bot/BotControlApi.h"
+#include "Bot/BotMission.h"
+#include "Bot/BotNeeds.h"
+#include "Bot/BotLifecycle.h"
 #include "Script/OllamaBotConfig.h"
 #include "Ai/OllamaRuntime.h"
 #include "Log.h"
@@ -21,7 +24,7 @@ AmigoPlannerRegistry& AmigoPlannerRegistry::Instance()
     return instance;
 }
 
-void AmigoPlannerRegistry::Enqueue(Player* bot, const AmigoPlannerState& plan)
+void AmigoPlannerRegistry::Enqueue(Player* bot, AmigoPlannerState const& plan)
 {
     // Queue a plan using a Player pointer.
     if (!bot)
@@ -33,7 +36,7 @@ void AmigoPlannerRegistry::Enqueue(Player* bot, const AmigoPlannerState& plan)
     plans_[bot->GetGUID().GetRawValue()].push_back(plan);
 }
 
-void AmigoPlannerRegistry::Enqueue(uint64 botGuid, const AmigoPlannerState& plan)
+void AmigoPlannerRegistry::Enqueue(uint64 botGuid, AmigoPlannerState const& plan)
 {
     // Queue a plan using a raw GUID.
     if (!botGuid)
@@ -93,19 +96,72 @@ void AmigoPlannerApplierScript::OnPlayerAfterUpdate(Player* player, uint32 /*dif
         return;
     }
 
-    const bool applied = HandleBotControlCommandTracked(player, plan.command);
-    if (applied && plan.command.type == BotControlCommandType::PlayerbotCommand &&
-        !plan.command.args.empty())
+    if (!BotMissionRegistry::Instance().RevisionMatches(botGuid, plan.missionRevision))
     {
-        // Update activity state for planner/control context.
-        const std::string& commandText = plan.command.args[0];
-        if (commandText == "grind")
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored queued Playerbot command for {} because mission revision {} is stale",
+                 player->GetName(), plan.missionRevision);
+        return;
+    }
+
+    if (GetBotLifecycleGeneration(botGuid) != plan.lifecycleGeneration)
+    {
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored queued Playerbot command for {} because lifecycle generation {} is stale",
+                 player->GetName(), plan.lifecycleGeneration);
+        return;
+    }
+
+    PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(player);
+    BotNeedAssessment queuedNeed = AssessBotNeeds(player);
+    BotLifecycleAssessment queuedLifecycle = AssessBotLifecycle(player, ai, queuedNeed);
+    if (queuedLifecycle.lane == BotLifecycleLane::Combat ||
+        queuedLifecycle.lane == BotLifecycleLane::Needs ||
+        queuedLifecycle.lane == BotLifecycleLane::Loot ||
+        HasActiveBotLifecycleOverlay(player) ||
+        (queuedLifecycle.lane == BotLifecycleLane::Maintenance && queuedLifecycle.urgent))
+    {
+        LOG_INFO("server.loading",
+                 "[OllamaBotAmigo] Ignored queued Playerbot command for {} because lifecycle lane '{}' owns execution (maintenance='{}', reason='{}')",
+                 player->GetName(),
+                 queuedLifecycle.LaneName(),
+                 queuedLifecycle.MaintenanceName(),
+                 queuedLifecycle.reason);
+        return;
+    }
+
+    const bool applied = HandleBotControlCommandTracked(player, plan.command);
+    if (applied && !plan.command.args.empty())
+    {
+        // Update activity state for planner/control context. Native strategy changes
+        // replace the old grind/follow/stay chat commands.
+        if (plan.command.type == BotControlCommandType::PlayerbotStrategy)
         {
-            UpdateActivityState(player, "grind", plan.reasoning);
+            bool entersGrind = false;
+            bool leavesGrind = false;
+            for (std::string const& spec : plan.command.args)
+            {
+                entersGrind = entersGrind || spec.find("+grind") != std::string::npos;
+                leavesGrind = leavesGrind || spec.find("-grind") != std::string::npos;
+            }
+            if (entersGrind)
+            {
+                UpdateActivityState(player, "grind", plan.reasoning);
+            }
+            else if (leavesGrind)
+            {
+                UpdateActivityState(player, "", plan.reasoning);
+            }
         }
-        else if (commandText == "follow" || commandText == "stay")
+        else if (plan.command.type == BotControlCommandType::PlayerbotCommand)
         {
-            UpdateActivityState(player, "", plan.reasoning);
+            std::string const& commandText = plan.command.args[0];
+            if (commandText == "grind")
+            {
+                UpdateActivityState(player, "grind", plan.reasoning);
+            }
+            else if (commandText == "follow" || commandText == "stay")
+            {
+                UpdateActivityState(player, "", plan.reasoning);
+            }
         }
     }
 
@@ -140,6 +196,7 @@ void AmigoBotLoginScript::OnPlayerLogin(Player* player)
         return;
     }
 
+    ResetBotLifecycle(player);
     ai->ResetStrategies();
 
     if (g_EnableOllamaBotAmigoDebug)

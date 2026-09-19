@@ -90,7 +90,7 @@ public:
     std::vector<ShortTermGoalsChange> GetShortTermGoalsChanges(size_t max) const;
     std::vector<ShortTermGoalCompletion> GetShortTermGoalCompletions(size_t max) const;
 
-    static const char* MovementToolName(MovementTool tool);
+    static char const* MovementToolName(MovementTool tool);
 
 private:
     template <class T>

@@ -18,6 +18,8 @@ struct AmigoPlannerState
     // Command + reasoning produced by the LLM planner/control pipeline.
     BotControlCommand command;
     std::string reasoning;
+    uint64 missionRevision = 0;
+    uint64 lifecycleGeneration = 0;
 };
 
 class AmigoPlannerRegistry
@@ -25,8 +27,8 @@ class AmigoPlannerRegistry
 public:
     // Singleton FIFO queue per bot for planner output.
     static AmigoPlannerRegistry& Instance();
-    void Enqueue(Player* bot, const AmigoPlannerState& plan);
-    void Enqueue(uint64 botGuid, const AmigoPlannerState& plan);
+    void Enqueue(Player* bot, AmigoPlannerState const& plan);
+    void Enqueue(uint64 botGuid, AmigoPlannerState const& plan);
     bool TryDequeue(uint64 botGuid, AmigoPlannerState& out);
 
 private:

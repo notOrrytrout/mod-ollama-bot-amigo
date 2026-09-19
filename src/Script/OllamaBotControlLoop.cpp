@@ -1,8 +1,11 @@
 #include "Script/OllamaBotControlLoop.h"
 #include "Ai/ControlAction.h"
+#include "Ai/BotMindState.h"
 #include "Script/OllamaBotConfig.h"
 #include "Bot/BotControlApi.h"
 #include "Ai/LlmContext.h"
+#include "Ai/LlmDispatch.h"
+#include "Ai/OllamaClient.h"
 #include "Ai/LlmRoles.h"
 #include "DBCStores.h"
 #include "Util/PlayerbotsCompat.h"
@@ -24,6 +27,10 @@
 #include "Bot/BotTravel.h"
 #include "Bot/BotProfession.h"
 #include "Bot/BotNavState.h"
+#include "Bot/BotMission.h"
+#include "Bot/BotNeeds.h"
+#include "Bot/BotLifecycle.h"
+#include "LootObjectStack.h"
 #include "Script/OllamaBotPlannerRefresh.h"
 #include <array>
 #include <algorithm>
@@ -33,7 +40,6 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
-#include <curl/curl.h>
 #include <ctime>
 #include <iomanip>
 #include <limits>
@@ -50,6 +56,9 @@
 
 namespace
 {
+    std::mutex gLatestControlStateMutex;
+    std::string gLatestControlStateJson;
+
     // Timing and tuning constants for planner/control loops.
     // Defaults are tuned to scale across many bots without spamming the control plane.
     constexpr uint32 kStrategicIntervalMs = 20000;           // 20s
@@ -73,7 +82,7 @@ namespace
     struct DistanceBand
     {
         // Label and concrete distance for move hop tool arguments.
-        const char *label;
+        char const* label;
         float distance;
     };
 
@@ -97,9 +106,46 @@ namespace
         return kMoveHopDistanceBands.back().label;
     }
 
+    std::string DistanceText(float distance)
+    {
+        std::ostringstream value;
+        value << std::fixed << std::setprecision(1) << distance << " yd (" << DistanceBandLabelForDistance(distance) << ")";
+        return value.str();
+    }
+
+    void SuppressAutonomousMovement(Player* bot, PlayerbotAI* ai)
+    {
+        if (!bot || !ai || HasActiveBotLifecycleOverlay(bot))
+            return;
+
+        std::string activity;
+        std::string reason;
+        bool retainGrind = TryGetActivityState(bot, activity, reason) && activity == "grind";
+        bool hadAutonomousMovement = ai->HasStrategy("rpg", BOT_STATE_NON_COMBAT) ||
+                                     ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) ||
+                                     ai->HasStrategy("move random", BOT_STATE_NON_COMBAT) ||
+                                     ai->HasStrategy("travel", BOT_STATE_NON_COMBAT) ||
+                                     (!retainGrind && ai->HasStrategy("grind", BOT_STATE_NON_COMBAT));
+        if (!hadAutonomousMovement)
+            return;
+
+        ai->ChangeStrategy("-rpg,-new rpg,-move random,-travel", BOT_STATE_NON_COMBAT);
+        if (!retainGrind)
+            ai->ChangeStrategy("-grind", BOT_STATE_NON_COMBAT);
+
+        if (g_EnableOllamaBotAmigoDebug)
+        {
+            LOG_INFO("server.loading",
+                     "[OllamaBotAmigo] Suppressed autonomous Playerbots movement for {} (retain_grind={})",
+                     bot->GetName(),
+                     retainGrind ? "yes" : "no");
+        }
+    }
+
     struct BotSnapshot
     {
         // Condensed view of bot/world state sent to the LLM.
+        uint64 botGuid = 0;
         uint32 nowMs = 0;
         Position3 pos;
         float orientation = 0.0f;
@@ -141,6 +187,11 @@ namespace
         float hpPct = 0.0f;
         float manaPct = 0.0f;
         uint32 level = 0;
+        BotMission mission;
+        uint64 missionRevision = 1;
+        uint64 lifecycleGeneration = 1;
+        BotNeedAssessment topNeed;
+        BotLifecycleAssessment lifecycle;
         bool hasWeapon = false;
         std::vector<std::string> weaponTypes;
         std::vector<std::string> professions;
@@ -176,6 +227,8 @@ namespace
             std::vector<QuestObjectiveProgress> objectives;
         };
         std::vector<QuestProgress> activeQuests;
+        bool postGrindDecision = false;
+        std::vector<std::string> postGrindOptions;
         struct QuestPoi
         {
             uint32 questId = 0;
@@ -199,6 +252,7 @@ namespace
             bool isVendor = false;
             bool isTrainer = false;
             bool isRepair = false;
+            bool isFlightMaster = false;
         };
         std::vector<NearbyEntity> nearbyEntities;
         struct QuestGiverInRange
@@ -501,6 +555,8 @@ namespace
     {
         // Planner output waiting to be applied on the main thread.
         PlannerPlan plan;
+        uint64 missionRevision = 0;
+        uint64 lifecycleGeneration = 0;
         bool hasUpdate = false;
         bool refreshedShortTermGoals = false;
     };
@@ -535,6 +591,215 @@ namespace
         return value;
     }
 
+    BotMission BuildConfiguredMission()
+    {
+        BotMission mission;
+        std::string kind = NormalizeCommandToken(g_OllamaBotControlMissionKind);
+        mission.target = TrimCopy(g_OllamaBotControlMissionTarget);
+        mission.role = TrimCopy(g_OllamaBotControlMissionRole);
+
+        if (kind == "gather") mission.kind = BotMissionKind::Gather;
+        else if (kind == "grind") mission.kind = BotMissionKind::Grind;
+        else if (kind == "pvp_bg" || kind == "pvp") mission.kind = BotMissionKind::PvpBg;
+        else if (kind == "party") mission.kind = BotMissionKind::Party;
+        else if (kind == "raid") mission.kind = BotMissionKind::Raid;
+        else if (kind == "goal") mission.kind = BotMissionKind::Goal;
+        else mission.kind = BotMissionKind::Quest;
+
+        // Preserve the existing hard quest-only override.
+        if (g_OllamaBotControlQuestingOnly)
+        {
+            mission.kind = BotMissionKind::Quest;
+            mission.target.clear();
+            mission.role.clear();
+        }
+
+        return mission;
+    }
+
+    std::string MissionSignature(BotMission const& mission)
+    {
+        return mission.KindName() + "\n" + mission.target + "\n" + mission.role;
+    }
+
+    bool MissionAllowsControlCapability(BotMission const& mission, ControlAction::Capability capability, std::string& reason,
+                                        bool postGrindDecision = false)
+    {
+        reason.clear();
+        if (capability == ControlAction::Capability::EnterAttackPull && mission.kind != BotMissionKind::Grind)
+        {
+            reason = "targeted_attack_requires_named_grind";
+            return false;
+        }
+        if (capability == ControlAction::Capability::GatherTarget && mission.kind != BotMissionKind::Gather)
+        {
+            reason = "targeted_gather_requires_named_gather";
+            return false;
+        }
+        switch (mission.kind)
+        {
+            case BotMissionKind::Gather:
+                if (capability == ControlAction::Capability::EnterGrind ||
+                    capability == ControlAction::Capability::EnterAttackPull ||
+                    capability == ControlAction::Capability::TalkToQuestGiver)
+                {
+                    reason = "gather_mission_scope";
+                    return false;
+                }
+                if ((capability == ControlAction::Capability::Fish || capability == ControlAction::Capability::UseProfession) &&
+                    NormalizeCommandToken(mission.target) != "fish" && NormalizeCommandToken(mission.target) != "fishing")
+                {
+                    reason = "named_gather_executor_not_available";
+                    return false;
+                }
+                return true;
+            case BotMissionKind::Grind:
+                if ((capability == ControlAction::Capability::TalkToQuestGiver && !postGrindDecision) ||
+                    capability == ControlAction::Capability::Fish ||
+                    capability == ControlAction::Capability::UseProfession)
+                {
+                    reason = "grind_mission_scope";
+                    return false;
+                }
+                if (capability == ControlAction::Capability::EnterGrind && !TrimCopy(mission.target).empty() && !postGrindDecision)
+                {
+                    // The existing grind command is not target-scoped. Do not pretend
+                    // exact named grind missions are enforced until a targeted executor exists.
+                    reason = "named_grind_requires_targeted_executor";
+                    return false;
+                }
+                return true;
+            case BotMissionKind::PvpBg:
+                if (capability == ControlAction::Capability::EnterGrind ||
+                    capability == ControlAction::Capability::EnterAttackPull ||
+                    capability == ControlAction::Capability::TalkToQuestGiver ||
+                    capability == ControlAction::Capability::Fish ||
+                    capability == ControlAction::Capability::UseProfession)
+                {
+                    reason = "pvp_mission_scope";
+                    return false;
+                }
+                return true;
+            case BotMissionKind::Quest:
+            case BotMissionKind::Party:
+            case BotMissionKind::Raid:
+            case BotMissionKind::Goal:
+            default:
+                return true;
+        }
+    }
+
+    bool ServiceDeterministicLifecycle(Player* bot,
+                                       PlayerbotAI* ai,
+                                       uint64 missionRevision,
+                                       bool allowOptionalMaintenance)
+    {
+        BotNeedAssessment topNeed = AssessBotNeeds(bot);
+        BotLifecycleAssessment lifecycle = AssessBotLifecycle(bot, ai, topNeed);
+
+        const bool maintenanceOwns = lifecycle.lane == BotLifecycleLane::Maintenance &&
+                                     (lifecycle.urgent || allowOptionalMaintenance || HasActiveBotLifecycleOverlay(bot)) &&
+                                     CanAcquireBotLifecycleMaintenance(bot, lifecycle.urgent);
+        BotLifecycleLane effectiveLane = BotLifecycleLane::Mission;
+        if (lifecycle.lane == BotLifecycleLane::Combat)
+            effectiveLane = BotLifecycleLane::Combat;
+        else if (lifecycle.lane == BotLifecycleLane::Needs)
+            effectiveLane = BotLifecycleLane::Needs;
+        else if (lifecycle.lane == BotLifecycleLane::Loot)
+            effectiveLane = BotLifecycleLane::Loot;
+        else if (maintenanceOwns)
+            effectiveLane = BotLifecycleLane::Maintenance;
+        SynchronizeBotLifecycleLane(bot, effectiveLane);
+
+        // Higher-priority deterministic lanes suspend a retained maintenance
+        // overlay without changing the durable mission.
+        if (lifecycle.lane != BotLifecycleLane::Maintenance)
+            ServiceBotLifecycle(bot, ai, lifecycle, missionRevision, allowOptionalMaintenance);
+
+        if (lifecycle.lane == BotLifecycleLane::Combat)
+        {
+            // Playerbots owns normal combat after Amigo has selected/validated
+            // the engagement. Do not spend LLM calls steering an active fight.
+            UpdateActivityState(bot, "combat", lifecycle.reason);
+            return true;
+        }
+
+        if (lifecycle.lane == BotLifecycleLane::Needs)
+        {
+            char const* recoveryAction = nullptr;
+            switch (topNeed.kind)
+            {
+                case BotNeedKind::Health: recoveryAction = "food"; break;
+                case BotNeedKind::Mana: recoveryAction = "drink"; break;
+                case BotNeedKind::Survival:
+                    if (bot && bot->IsAlive())
+                        recoveryAction = "flee";
+                    break;
+                case BotNeedKind::None:
+                default:
+                    break;
+            }
+
+            bool started = false;
+            if (recoveryAction)
+                started = ExecutePlayerbotAction(bot, recoveryAction);
+
+            if (g_EnableOllamaBotAmigoDebug && bot)
+            {
+                LOG_INFO("server.loading",
+                         "[OllamaBotAmigo] Lifecycle needs lane for {}: kind={} reason={} playerbots_action={} started={}",
+                         bot->GetName(),
+                         topNeed.KindName(),
+                         topNeed.reason,
+                         recoveryAction ? recoveryAction : "native_dead_state",
+                         started ? "yes" : "no");
+            }
+            return true;
+        }
+
+        if (lifecycle.lane == BotLifecycleLane::Loot)
+        {
+            // Drive Playerbots' existing loot state machine directly. These
+            // actions retain Playerbots' own distance, ownership, movement,
+            // lock/skill, and open-loot checks. Repeated ticks advance from
+            // target selection to approach and finally opening the target.
+            if (AiObjectContext* context = ai->GetAiObjectContext())
+            {
+                if (LootObjectStack* availableLoot = context->GetValue<LootObjectStack*>("available loot")->Get())
+                {
+                    LootObject pendingLoot = availableLoot->GetLoot();
+                    if (!pendingLoot.IsEmpty())
+                        context->GetValue<LootObject>("loot target")->Set(pendingLoot);
+                }
+            }
+            const bool selected = ExecutePlayerbotAction(bot, "loot");
+            const bool moved = ExecutePlayerbotAction(bot, "move to loot");
+            const bool opened = ExecutePlayerbotAction(bot, "open loot");
+            UpdateActivityState(bot, "loot", lifecycle.reason);
+            if (g_EnableOllamaBotAmigoDebug && bot)
+            {
+                LOG_INFO("server.loading",
+                         "[OllamaBotAmigo] Lifecycle loot lane for {}: selected={} moved={} opened={} reason='{}'",
+                         bot->GetName(),
+                         selected ? "yes" : "no",
+                         moved ? "yes" : "no",
+                         opened ? "yes" : "no",
+                         lifecycle.reason);
+            }
+            return true;
+        }
+
+        if (maintenanceOwns)
+        {
+            if (ServiceBotLifecycle(bot, ai, lifecycle, missionRevision, allowOptionalMaintenance))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     bool UseCompactPromptFormat()
     {
         return NormalizeCommandToken(g_OllamaBotControlPromptFormat) == "compact";
@@ -548,9 +813,9 @@ namespace
             .count();
     }
 
-    uint32 ReadEnvDelayMs(const char *name, uint32 fallback)
+    uint32 ReadEnvDelayMs(char const* name, uint32 fallback)
     {
-        const char *value = std::getenv(name);
+        char const* value = std::getenv(name);
         if (!value || !*value)
             return fallback;
 
@@ -645,55 +910,6 @@ namespace
         if (s.find("\"name\"") != std::string::npos || s.find("\"arguments\"") != std::string::npos)
         {
             return true;
-        }
-        return false;
-    }
-
-    bool LooksLikeListItem(std::string const &text)
-    {
-        std::string s = TrimCopy(text);
-        if (s.empty())
-        {
-            return false;
-        }
-        if (s[0] == '-' || s[0] == '*')
-        {
-            return true;
-        }
-        // "1. foo" or "1) foo"
-        size_t dotPos = s.find('.');
-        if (dotPos != std::string::npos && dotPos > 0 && dotPos <= 3)
-        {
-            bool numeric = true;
-            for (size_t i = 0; i < dotPos; ++i)
-            {
-                if (!std::isdigit(static_cast<unsigned char>(s[i])))
-                {
-                    numeric = false;
-                    break;
-                }
-            }
-            if (numeric)
-            {
-                return true;
-            }
-        }
-        size_t parenPos = s.find(')');
-        if (parenPos != std::string::npos && parenPos > 0 && parenPos <= 3)
-        {
-            bool numeric = true;
-            for (size_t i = 0; i < parenPos; ++i)
-            {
-                if (!std::isdigit(static_cast<unsigned char>(s[i])))
-                {
-                    numeric = false;
-                    break;
-                }
-            }
-            if (numeric)
-            {
-                return true;
-            }
         }
         return false;
     }
@@ -1019,6 +1235,16 @@ namespace
                 oss << " quest_id=" << action.questId;
             }
             break;
+        case ControlAction::Capability::VendorSell: oss << "vendor_sell"; break;
+        case ControlAction::Capability::VendorBuyUseful: oss << "vendor_buy_useful"; break;
+        case ControlAction::Capability::Repair: oss << "repair"; break;
+        case ControlAction::Capability::Trainer: oss << "trainer"; break;
+        case ControlAction::Capability::Hearthstone: oss << "hearthstone"; break;
+        case ControlAction::Capability::Taxi: oss << "taxi"; break;
+        case ControlAction::Capability::Loot: oss << "loot"; break;
+        case ControlAction::Capability::Food: oss << "food"; break;
+        case ControlAction::Capability::Drink: oss << "drink"; break;
+        case ControlAction::Capability::Maintenance: oss << "maintenance"; break;
         case ControlAction::Capability::Fish:
             oss << "fish";
             break;
@@ -1097,24 +1323,21 @@ namespace
 
     bool IsFollowingCorrectly(Player *bot, PlayerbotAI *ai)
     {
-        // Check follow distance against Playerbot config.
+        // Follow correctness is based on Amigo's explicit temporary peer
+        // directive, never on Playerbots' master pointer. Group membership by
+        // itself does not grant authority.
         if (!bot || !ai)
-        {
             return false;
-        }
 
-        Player *master = ai->GetMaster();
-        if (!master || !master->IsInWorld())
-        {
+        AmigoBotMindSnapshot mind = AmigoMindSnapshot(bot->GetGUID().GetRawValue());
+        if (mind.peerDirective.kind != AmigoPeerDirectiveKind::Follow || !mind.peerDirective.targetGuid)
             return false;
-        }
 
-        if (master == bot)
-        {
-            return true;
-        }
+        Player* target = ObjectAccessor::FindConnectedPlayer(ObjectGuid(mind.peerDirective.targetGuid));
+        if (!target || !target->IsInWorld() || target->GetGroup() != bot->GetGroup())
+            return false;
 
-        return bot->IsWithinDistInMap(master, sPlayerbotAIConfig.followDistance);
+        return bot->IsWithinDistInMap(target, sPlayerbotAIConfig.followDistance);
     }
 
     struct ToolCall
@@ -1127,8 +1350,8 @@ namespace
     struct ControlToolDefinition
     {
         // Control tool metadata for validation and mapping.
-        const char *name;
-        const char *signature;
+        char const* name;
+        char const* signature;
         ControlAction::Capability capability;
         bool requiresDirection;
         bool requiresDistance;
@@ -1141,7 +1364,7 @@ namespace
         bool requiresCandidateId;
     };
 
-    const std::array<ControlToolDefinition, 13> kControlTools = {
+    const std::array<ControlToolDefinition, 20> kControlTools = {
         ControlToolDefinition{
             "request_idle",
             "request_idle()",
@@ -1189,6 +1412,32 @@ namespace
             false,
             false,
             false,
+            false,
+            false,
+            false,
+            false,
+            false},
+        ControlToolDefinition{
+            "request_attack_target",
+            "request_attack_target(entry_id)",
+            ControlAction::Capability::EnterAttackPull,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false},
+        ControlToolDefinition{
+            "request_gather_target",
+            "request_gather_target(entry_id)",
+            ControlAction::Capability::GatherTarget,
+            false,
+            false,
+            false,
+            true,
             false,
             false,
             false,
@@ -1246,6 +1495,16 @@ namespace
             false,
             false,
             false},
+        ControlToolDefinition{
+            "request_hearthstone",
+            "request_hearthstone()",
+            ControlAction::Capability::Hearthstone,
+            false, false, false, false, false, false, false, false, false},
+        ControlToolDefinition{
+            "request_taxi",
+            "request_taxi()",
+            ControlAction::Capability::Taxi,
+            false, false, false, false, false, false, false, false, false},
         ControlToolDefinition{
             "request_fish",
             "request_fish()",
@@ -1311,7 +1570,22 @@ namespace
             false,
             false,
             false,
-            false}};
+            false},
+        ControlToolDefinition{
+            "request_repair",
+            "request_repair()",
+            ControlAction::Capability::Repair,
+            false, false, false, false, false, false, false, false, false},
+        ControlToolDefinition{
+            "request_vendor_sell",
+            "request_vendor_sell()",
+            ControlAction::Capability::VendorSell,
+            false, false, false, false, false, false, false, false, false},
+        ControlToolDefinition{
+            "request_trainer",
+            "request_trainer()",
+            ControlAction::Capability::Trainer,
+            false, false, false, false, false, false, false, false, false}};
 
     bool TryExtractToolCall(std::string const &reply, ToolCall &outCall, std::string &outJson)
     {
@@ -1384,7 +1658,7 @@ namespace
     bool FindControlToolDefinition(std::string const &name, ControlToolDefinition &outDefinition)
     {
         // Look up tool metadata by name.
-        for (const auto &tool : kControlTools)
+        for (auto const& tool : kControlTools)
         {
             if (name == tool.name)
             {
@@ -1418,16 +1692,7 @@ namespace
         return !outSkill.empty() && !outIntent.empty();
     }
 
-    static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
-    {
-        // cURL write callback for accumulating response payloads.
-        std::string *responseBuffer = static_cast<std::string *>(userp);
-        size_t totalSize = size * nmemb;
-        responseBuffer->append(static_cast<char *>(contents), totalSize);
-        return totalSize;
-    }
-
-    const char *DescribeControlTool(const char *name)
+    char const* DescribeControlTool(char const* name)
     {
         // Short descriptions used in the control prompt.
         if (std::strcmp(name, "request_idle") == 0)
@@ -1441,6 +1706,14 @@ namespace
         if (std::strcmp(name, "request_enter_grind") == 0)
         {
             return "fight nearby mobs (grind / quest objectives)";
+        }
+        if (std::strcmp(name, "request_attack_target") == 0)
+        {
+            return "attack the exact nearby creature selected by entry_id";
+        }
+        if (std::strcmp(name, "request_gather_target") == 0)
+        {
+            return "gather the exact nearby game object selected by entry_id using Playerbots loot handling";
         }
         if (std::strcmp(name, "request_stop_grind") == 0)
         {
@@ -1458,6 +1731,8 @@ namespace
         {
             return "talk to a quest giver in range (accept or turn in a quest)";
         }
+        if (std::strcmp(name, "request_hearthstone") == 0) return "use the hearthstone through Playerbots item logic";
+        if (std::strcmp(name, "request_taxi") == 0) return "use Playerbots taxi handling at a nearby flight master";
         if (std::strcmp(name, "request_fish") == 0)
         {
             return "perform fishing from the current spot (no movement)";
@@ -1487,9 +1762,9 @@ namespace
         std::ostringstream oss;
         for (size_t i = 0; i < kControlTools.size(); ++i)
         {
-            const auto &tool = kControlTools[i];
+            auto const& tool = kControlTools[i];
             oss << prefix << tool.signature;
-            const char *description = DescribeControlTool(tool.name);
+            char const* description = DescribeControlTool(tool.name);
             if (description && description[0] != '\0')
             {
                 oss << " — " << description;
@@ -1502,72 +1777,16 @@ namespace
         return oss.str();
     }
 
-    std::string QueryOllamaLLMOnce(std::string const &prompt, std::string const &model)
+    std::string QueryOllamaLLMOnce(std::string const &prompt, std::string const &model, bool requestThink)
     {
-        // Blocking LLM request used by planner/control threads.
-        constexpr long kOllamaConnectTimeoutMs = 5000;
-        constexpr long kOllamaRequestTimeoutMs = 120000;
-
-        if (model.empty())
+        // Worker-side provider-neutral request. Ollama and oMLX share this path.
+        AmigoOllamaResult result = QueryOllamaLLMEx(model, prompt, requestThink);
+        if (!result.ok)
         {
-            LOG_ERROR("server.loading", "[OllamaBotAmigo] Missing Ollama model for request.");
+            LOG_INFO("server.loading", "[OllamaBotAmigo] LLM request failed: {}", result.error);
             return "";
         }
-        std::string resolvedModel = model;
-        CURL *curl = curl_easy_init();
-        if (!curl)
-        {
-            LOG_INFO("server.loading", "[OllamaBotAmigo] Failed to initialize cURL.");
-            return "";
-        }
-
-        nlohmann::json requestData = {
-            {"model", resolvedModel},
-            {"prompt", prompt}};
-        std::string requestDataStr = requestData.dump();
-
-        struct curl_slist *headers = nullptr;
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-
-        std::string responseBuffer;
-        curl_easy_setopt(curl, CURLOPT_URL, g_OllamaBotControlUrl.c_str());
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, requestDataStr.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, long(requestDataStr.length()));
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBuffer);
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, kOllamaConnectTimeoutMs);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, kOllamaRequestTimeoutMs);
-
-        CURLcode res = curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-
-        if (res != CURLE_OK)
-        {
-            LOG_INFO("server.loading", "[OllamaBotAmigo] Failed to reach Ollama AI. cURL error: {}", curl_easy_strerror(res));
-            return "";
-        }
-
-        std::stringstream ss(responseBuffer);
-        std::string line;
-        std::string extracted;
-        while (std::getline(ss, line))
-        {
-            try
-            {
-                nlohmann::json jsonResponse = nlohmann::json::parse(line);
-                if (jsonResponse.contains("response"))
-                {
-                    extracted += jsonResponse["response"].get<std::string>();
-                }
-            }
-            catch (...)
-            {
-            }
-        }
-        return extracted;
+        return result.text;
     }
 
     std::string BuildControlToolInstructions(std::string const &stateToken)
@@ -1625,7 +1844,7 @@ request_profession format:
         return oss.str();
     }
 
-    const char *CapabilityName(ControlAction::Capability capability)
+    char const* CapabilityName(ControlAction::Capability capability)
     {
         // Human-readable labels for logging and summaries.
         switch (capability)
@@ -1642,12 +1861,24 @@ request_profession format:
             return "stop_grind";
         case ControlAction::Capability::EnterAttackPull:
             return "enter_attack_pull";
+        case ControlAction::Capability::GatherTarget:
+            return "gather_target";
         case ControlAction::Capability::Stay:
             return "stay";
         case ControlAction::Capability::Unstay:
             return "unstay";
         case ControlAction::Capability::TalkToQuestGiver:
             return "talk_to_quest_giver";
+        case ControlAction::Capability::VendorSell: return "vendor_sell";
+        case ControlAction::Capability::VendorBuyUseful: return "vendor_buy_useful";
+        case ControlAction::Capability::Repair: return "repair";
+        case ControlAction::Capability::Trainer: return "trainer";
+        case ControlAction::Capability::Hearthstone: return "hearthstone";
+        case ControlAction::Capability::Taxi: return "taxi";
+        case ControlAction::Capability::Loot: return "loot";
+        case ControlAction::Capability::Food: return "food";
+        case ControlAction::Capability::Drink: return "drink";
+        case ControlAction::Capability::Maintenance: return "maintenance";
         case ControlAction::Capability::Fish:
             return "fish";
         case ControlAction::Capability::UseProfession:
@@ -1908,7 +2139,7 @@ request_profession format:
     std::string DirectionLabelFromBearing(float bearingDeg)
     {
         // Map a bearing angle to a coarse cardinal label.
-        static constexpr std::array<const char *, 8> kDirections = {
+        static constexpr std::array<char const*, 8> kDirections = {
             "east",
             "northeast",
             "north",
@@ -2093,9 +2324,10 @@ request_profession format:
             entity.pos = Position3{creature->GetPositionX(), creature->GetPositionY(), creature->GetPositionZ()};
             entity.distance = bot->GetDistance(creature);
             entity.isQuestGiver = creature->IsQuestGiver();
-            entity.isVendor = creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_VENDOR);
-            entity.isTrainer = creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_TRAINER);
-            entity.isRepair = creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_REPAIR);
+            entity.isVendor = creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR);
+            entity.isTrainer = creature->HasNpcFlag(UNIT_NPC_FLAG_TRAINER);
+            entity.isRepair = creature->HasNpcFlag(UNIT_NPC_FLAG_REPAIR);
+            entity.isFlightMaster = creature->HasNpcFlag(UNIT_NPC_FLAG_FLIGHTMASTER);
             if (entity.isQuestGiver)
             {
                 QuestRelationBounds startBounds = sObjectMgr->GetCreatureQuestRelationBounds(creature->GetEntry());
@@ -2311,7 +2543,7 @@ request_profession format:
         return 115.0f + (static_cast<float>(level) - 70.0f) * 7.2f;
     }
 
-    const char *SlotName(uint8 slot)
+    char const* SlotName(uint8 slot)
     {
         switch (slot)
         {
@@ -2354,6 +2586,7 @@ request_profession format:
     {
         // Gather bot state needed for planning and control.
         BotSnapshot snapshot;
+        snapshot.botGuid = bot->GetGUID().GetRawValue();
         snapshot.pos = Position3{bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()};
         snapshot.orientation = bot->GetOrientation();
         snapshot.mapId = bot->GetMapId();
@@ -2362,6 +2595,22 @@ request_profession format:
         snapshot.inCombat = bot->IsInCombat();
         snapshot.isMoving = bot->isMoving();
         snapshot.level = bot->GetLevel();
+        BotMissionState missionState = BotMissionRegistry::Instance().Get(bot->GetGUID().GetRawValue());
+        snapshot.mission = missionState.mission;
+        snapshot.missionRevision = missionState.revision;
+        snapshot.lifecycleGeneration = GetBotLifecycleGeneration(bot);
+        snapshot.topNeed = AssessBotNeeds(bot);
+        snapshot.lifecycle = AssessBotLifecycle(bot, ai, snapshot.topNeed);
+        {
+            std::ostringstream missionText;
+            missionText << snapshot.mission.KindName();
+            if (!snapshot.mission.target.empty()) missionText << " " << snapshot.mission.target;
+            if (!snapshot.mission.role.empty()) missionText << " (" << snapshot.mission.role << ")";
+            std::string activityText = snapshot.lifecycle.LaneName();
+            if (snapshot.lifecycle.lane == BotLifecycleLane::Maintenance && snapshot.lifecycle.maintenance != BotMaintenanceKind::None)
+                activityText += std::string(":") + snapshot.lifecycle.MaintenanceName();
+            AmigoMindUpdateGameplay(snapshot.botGuid, missionText.str(), activityText);
+        }
         snapshot.navCandidates = BuildNavCandidates(bot);
         snapshot.questGiversInRange = BuildQuestGiversInRange(bot, ai);
         snapshot.nearbyEntities = BuildNearbyEntities(bot, ai);
@@ -2425,7 +2674,7 @@ request_profession format:
             snapshot.manaPct = (static_cast<float>(bot->GetPower(POWER_MANA)) / maxMana) * 100.0f;
         }
 
-        auto weaponSubClassLabel = [](uint8 subClass) -> const char *
+        auto weaponSubClassLabel = [](uint8 subClass) -> char const*
         {
             switch (subClass)
             {
@@ -2487,7 +2736,7 @@ request_profession format:
                 return;
             }
 
-            const char *label = weaponSubClassLabel(proto->SubClass);
+            char const* label = weaponSubClassLabel(proto->SubClass);
             if (!label || label[0] == '\0')
             {
                 return;
@@ -2512,7 +2761,7 @@ request_profession format:
             snapshot.hasWeapon = false;
         }
 
-        auto addSkill = [&](uint32 skillId, const char *label)
+        auto addSkill = [&](uint32 skillId, char const* label)
         {
             if (!label || label[0] == '\0')
             {
@@ -2644,6 +2893,82 @@ request_profession format:
                 }
 
                 snapshot.activeQuests.push_back(std::move(progress));
+            }
+        }
+
+        // A completed grind objective is a transition point. Give the control
+        // model a small, server-owned action list instead of an open-ended
+        // request. The normal Playerbot executors still perform the action.
+        if (snapshot.mission.kind == BotMissionKind::Grind)
+        {
+            for (auto const &quest : snapshot.activeQuests)
+            {
+                if (quest.status == QUEST_STATUS_COMPLETE)
+                {
+                    snapshot.postGrindDecision = true;
+                    for (auto const &giver : snapshot.questGiversInRange)
+                    {
+                        if (std::find(giver.turnInQuestIds.begin(), giver.turnInQuestIds.end(), quest.questId) != giver.turnInQuestIds.end())
+                        {
+                            snapshot.postGrindOptions.push_back("turn_in_quest:" + std::to_string(quest.questId) +
+                                                               " | " + giver.name + " | " +
+                                                               DistanceText(giver.distance));
+                        }
+                    }
+                }
+            }
+            for (auto const &quest : snapshot.activeQuests)
+            {
+                if (quest.status != QUEST_STATUS_INCOMPLETE)
+                    continue;
+                for (auto const &objective : quest.objectives)
+                {
+                    if (objective.current >= objective.required || objective.targetName.empty())
+                        continue;
+                    float targetDistance = 999.0f;
+                    for (auto const &entity : snapshot.nearbyEntities)
+                    {
+                        if (entity.name == objective.targetName)
+                        {
+                            targetDistance = entity.distance;
+                            break;
+                        }
+                    }
+                    snapshot.postGrindDecision = true;
+                    snapshot.postGrindOptions.push_back("continue_quest:" + std::to_string(quest.questId) +
+                                                       " | " + quest.title + " | " + objective.targetName + " " +
+                                                       std::to_string(objective.current) + "/" + std::to_string(objective.required) +
+                                                       " | " + DistanceText(targetDistance));
+                }
+            }
+            for (auto const &giver : snapshot.questGiversInRange)
+            {
+                for (uint32 questId : giver.availableNewQuestIds)
+                {
+                    snapshot.postGrindDecision = true;
+                    snapshot.postGrindOptions.push_back("accept_quest:" + std::to_string(questId));
+                }
+            }
+            for (auto const &entity : snapshot.nearbyEntities)
+            {
+                if (entity.isRepair && snapshot.lifecycle.durabilityPct < 100)
+                {
+                    snapshot.postGrindDecision = true;
+                    snapshot.postGrindOptions.push_back("repair | " + entity.name + " | " + DistanceText(entity.distance));
+                }
+                if (entity.isVendor && ai->GetAiObjectContext()->GetValue<uint32>("item count", "gray")->Get() > 0)
+                {
+                    snapshot.postGrindDecision = true;
+                    snapshot.postGrindOptions.push_back("sell_grays | " + entity.name + " | " + DistanceText(entity.distance));
+                }
+            }
+            if (snapshot.postGrindDecision)
+            {
+                snapshot.postGrindOptions.emplace_back("continue_grind");
+                snapshot.postGrindOptions.emplace_back("idle");
+                std::sort(snapshot.postGrindOptions.begin(), snapshot.postGrindOptions.end());
+                snapshot.postGrindOptions.erase(std::unique(snapshot.postGrindOptions.begin(), snapshot.postGrindOptions.end()),
+                                                snapshot.postGrindOptions.end());
             }
         }
 
@@ -2904,6 +3229,10 @@ request_profession format:
                 {"in_combat", bot.inCombat},
                 {"is_moving", bot.isMoving},
                 {"grind_mode", bot.grindMode},
+                {"mission", {{"kind", bot.mission.KindName()}, {"target", bot.mission.target}, {"role", bot.mission.role}, {"revision", bot.missionRevision}, {"planner_goal", bot.mission.PlannerGoal()}}},
+                {"lifecycle_generation", bot.lifecycleGeneration},
+                {"top_need", {{"kind", bot.topNeed.KindName()}, {"urgent", bot.topNeed.urgent}, {"score", bot.topNeed.score}, {"reason", bot.topNeed.reason}}},
+                {"lifecycle", {{"lane", bot.lifecycle.LaneName()}, {"maintenance", bot.lifecycle.MaintenanceName()}, {"urgent", bot.lifecycle.urgent}, {"score", bot.lifecycle.score}, {"reason", bot.lifecycle.reason}, {"bag_space_pct", bot.lifecycle.bagSpacePct}, {"durability_pct", bot.lifecycle.durabilityPct}, {"food_count", bot.lifecycle.foodCount}, {"drink_count", bot.lifecycle.drinkCount}, {"ammo_count", bot.lifecycle.ammoCount}}},
                 {"active_quest_ids", bot.activeQuestIds},
                 {"gear", {{"avg_item_level", std::round(bot.avgItemLevel * 10.0f) / 10.0f},
                           {"expected_avg_item_level", std::round(bot.expectedAvgItemLevel * 10.0f) / 10.0f},
@@ -2928,6 +3257,10 @@ request_profession format:
             {"hp_pct", std::round(bot.hpPct * 10.0f) / 10.0f},
             {"mana_pct", std::round(bot.manaPct * 10.0f) / 10.0f},
             {"level", bot.level},
+            {"mission", {{"kind", bot.mission.KindName()}, {"target", bot.mission.target}, {"role", bot.mission.role}, {"revision", bot.missionRevision}, {"planner_goal", bot.mission.PlannerGoal()}}},
+            {"lifecycle_generation", bot.lifecycleGeneration},
+            {"top_need", {{"kind", bot.topNeed.KindName()}, {"urgent", bot.topNeed.urgent}, {"score", bot.topNeed.score}, {"reason", bot.topNeed.reason}}},
+            {"lifecycle", {{"lane", bot.lifecycle.LaneName()}, {"maintenance", bot.lifecycle.MaintenanceName()}, {"urgent", bot.lifecycle.urgent}, {"score", bot.lifecycle.score}, {"reason", bot.lifecycle.reason}, {"bag_space_pct", bot.lifecycle.bagSpacePct}, {"durability_pct", bot.lifecycle.durabilityPct}, {"food_count", bot.lifecycle.foodCount}, {"drink_count", bot.lifecycle.drinkCount}, {"ammo_count", bot.lifecycle.ammoCount}}},
             {"gear", {{"avg_item_level", std::round(bot.avgItemLevel * 10.0f) / 10.0f},
                       {"expected_avg_item_level", std::round(bot.expectedAvgItemLevel * 10.0f) / 10.0f},
                       {"band", bot.gearBand}}},
@@ -2944,6 +3277,8 @@ request_profession format:
                             {"last_change_ms", bot.professionLastChangeMs}}},
             {"debug", {{"control_cooldown_remaining_ms", bot.controlCooldownRemainingMs}, {"ollama_backoff_ms", bot.controlOllamaBackoffMs}, {"memory_pending_writes", bot.memoryPendingWrites}, {"memory_next_flush_ms", bot.memoryNextFlushMs}}},
             {"active_quest_ids", bot.activeQuestIds},
+            {"post_grind_decision", bot.postGrindDecision},
+            {"post_grind_options", bot.postGrindOptions},
             {"active_quests", questList}};
         json["world_model"] = BuildWorldModelJson();
         json["local_area_model"] = {
@@ -3021,7 +3356,24 @@ request_profession format:
                                       {"is_vendor", entity.isVendor},
                                       {"is_trainer", entity.isTrainer},
                                       {"is_repair", entity.isRepair},
+                                      {"is_flight_master", entity.isFlightMaster},
                                       {"visible", true}});
+            // Include quest relations beyond interaction range so control can
+            // approach the correct turn-in NPC without guessing its identity.
+            nlohmann::json turnInIds = nlohmann::json::array();
+            if (entity.type == "npc" && entity.isQuestGiver)
+            {
+                auto bounds = sObjectMgr->GetCreatureQuestInvolvedRelationBounds(entity.entryId);
+                for (auto it = bounds.first; it != bounds.second; ++it)
+                {
+                    for (auto const& quest : bot.activeQuests)
+                    {
+                        if (quest.questId == it->second && quest.status == QUEST_STATUS_COMPLETE)
+                            turnInIds.push_back(quest.questId);
+                    }
+                }
+            }
+            nearbyEntities.back()["turn_in_quest_ids"] = std::move(turnInIds);
         }
         json["nearby_entities"] = nearbyEntities;
         if (goal)
@@ -3157,6 +3509,18 @@ request_profession format:
             << ", moving: " << (bot.isMoving ? "yes" : "no")
             << ", grind mode: " << (bot.grindMode ? "yes" : "no")
             << ", idle cycles: " << bot.idleCycles << ".\n";
+        oss << "Mission: " << bot.mission.KindName() << " (revision " << bot.missionRevision << ")";
+        if (!bot.mission.target.empty())
+            oss << ", target: " << bot.mission.target;
+        if (!bot.mission.role.empty())
+            oss << ", role: " << bot.mission.role;
+        oss << ".\n";
+        if (bot.topNeed.kind != BotNeedKind::None)
+        {
+            oss << "Top need: " << bot.topNeed.KindName() << ", score " << bot.topNeed.score
+                << ", urgent: " << (bot.topNeed.urgent ? "yes" : "no")
+                << ", reason: " << bot.topNeed.reason << ".\n";
+        }
         oss << "Travel: " << (bot.travelActive ? "active" : "inactive");
         if (bot.travelActive && !bot.travelLabel.empty())
         {
@@ -3541,7 +3905,7 @@ request_profession format:
     {
         // Shared context header for planner prompts.
         const OllamaSettings settings = GetOllamaSettings();
-        const std::string &systemPrompt = GetPrompt(LLMRole::Planner, settings);
+        std::string const& systemPrompt = GetPrompt(LLMRole::Planner, settings);
 
         std::ostringstream oss;
         if (!systemPrompt.empty())
@@ -3571,21 +3935,6 @@ request_profession format:
         out << "----\n";
     }
 
-    std::string BuildLongTermGoalPrompt(BotSnapshot const &bot, WorldSnapshot const &world)
-    {
-        // Prompt the planner to produce a long-term goal sentence.
-        std::ostringstream oss;
-        oss << BuildPlannerContext(bot, world);
-        oss << R"(INSTRUCTIONS
-Write a single-sentence long-term goal based on STATE_SUMMARY.
-- Output exactly one sentence.
-- Use plain natural language.
-- Do not mention tools, schemas, or JSON.
-- Do not use bullet points or numbering.
-)";
-        return oss.str();
-    }
-
     std::string BuildLongTermGoalReviewPrompt(BotSnapshot const &bot, WorldSnapshot const &world, std::string const &proposedGoal)
     {
         // Ask the planner to confirm or revise a long-term goal.
@@ -3604,25 +3953,6 @@ If it is no longer relevant, replace it with a new single-sentence long-term goa
         return oss.str();
     }
 
-    std::string BuildShortTermGoalsPrompt(BotSnapshot const &bot, WorldSnapshot const &world, std::string const &longTermGoal)
-    {
-        // Prompt the planner to break a long-term goal into short-term goals.
-        std::ostringstream oss;
-        oss << BuildPlannerContext(bot, world);
-        oss << "LONG_TERM_GOAL\n";
-        oss << longTermGoal << "\n\n";
-        oss << R"(INSTRUCTIONS
-Break the long-term goal into short-term goals, using STATE_SUMMARY for context.
-- Provide 3 to 5 short-term goals.
-- Each short-term goal must be 2 to 3 sentences describing a concrete near-term objective.
-- Separate each short-term goal with a blank line.
-- Use plain natural language only.
-- Do not mention tools, schemas, or JSON.
-- Do not use numbered or bulleted lists.
-)";
-        return oss.str();
-    }
-
     // --
     // Two-phase planner prompt builders
     //
@@ -3632,7 +3962,7 @@ Break the long-term goal into short-term goals, using STATE_SUMMARY for context.
     std::string BuildPlannerLongTermPrompt(BotSnapshot const &bot, WorldSnapshot const &world, std::string const &memory)
     {
         const OllamaSettings settings = GetOllamaSettings();
-        const std::string &systemPrompt = GetPrompt(LLMRole::PlannerLongTerm, settings);
+        std::string const& systemPrompt = GetPrompt(LLMRole::PlannerLongTerm, settings);
         std::ostringstream oss;
         if (!systemPrompt.empty())
         {
@@ -3644,11 +3974,29 @@ Break the long-term goal into short-term goals, using STATE_SUMMARY for context.
             oss << "MEMORY\n";
             oss << memory << "\n\n";
         }
+        std::string socialContext = AmigoMindBuildPromptContext(bot.botGuid);
+        if (!socialContext.empty())
+        {
+            oss << "SOCIAL_CONTEXT\n" << socialContext << "\n";
+        }
+        if (g_AmigoPersonalityEnable)
+        {
+            oss << "PERSONALITY_CONTEXT\n" << g_AmigoPersonalityName;
+            if (!g_AmigoPersonalityPrompt.empty()) oss << ": " << g_AmigoPersonalityPrompt;
+            oss << "\nUse personality only to break ties between valid strategic choices; it never overrides mission scope, lifecycle policy, or Playerbots mechanics.\n\n";
+        }
         oss << "STATE_SUMMARY\n";
         oss << BuildPlannerStateSummary(bot, world) << "\n\n";
         oss << "INSTRUCTIONS\n";
         oss << "Write a single-sentence long-term goal based on STATE_SUMMARY and MEMORY.\n";
-        oss << "- Prefer picking up nearby available quests, nearby quest objectives, and nearby quest turn-ins when possible.\n";
+        oss << "- Stay within the typed mission shown in STATE_SUMMARY. Do not broaden or replace that mission.\n";
+        oss << "- SOCIAL_CONTEXT may describe player requests. Treat them as preferences only unless they fit the authoritative mission and Amigo policy.\n";
+        if (g_AmigoGroupAuthority == "peer")
+            oss << "- Party membership or party leadership does not grant ownership. Group members are peers; only explicit temporary cooperative directives may affect follow/assist behavior.\n";
+        if (bot.mission.kind == BotMissionKind::Gather || bot.mission.kind == BotMissionKind::Grind)
+            oss << "- The named mission target is exact. Do not substitute a similar resource or creature name.\n";
+        if (bot.mission.kind == BotMissionKind::Quest)
+            oss << "- Prefer picking up nearby available quests, nearby quest objectives, and nearby quest turn-ins when possible.\n";
         oss << "- If you mention talking to a quest giver, prefer quest givers that turn in ACTIVE quests, and do not suggest unrelated NPCs.\n";
         oss << "- Output exactly one sentence.\n";
         oss << "- Use plain natural language.\n";
@@ -3664,7 +4012,7 @@ Break the long-term goal into short-term goals, using STATE_SUMMARY for context.
     std::string BuildPlannerShortTermPrompt(BotSnapshot const &bot, WorldSnapshot const &world, std::string const &memory, std::string const &longTermGoal, std::string const &focusQuest)
     {
         const OllamaSettings settings = GetOllamaSettings();
-        const std::string &systemPrompt = GetPrompt(LLMRole::PlannerShortTerm, settings);
+        std::string const& systemPrompt = GetPrompt(LLMRole::PlannerShortTerm, settings);
         std::ostringstream oss;
         if (!systemPrompt.empty())
         {
@@ -3674,6 +4022,17 @@ Break the long-term goal into short-term goals, using STATE_SUMMARY for context.
         {
             oss << "MEMORY\n";
             oss << memory << "\n\n";
+        }
+        std::string socialContext = AmigoMindBuildPromptContext(bot.botGuid);
+        if (!socialContext.empty())
+        {
+            oss << "SOCIAL_CONTEXT\n" << socialContext << "\n";
+        }
+        if (g_AmigoPersonalityEnable)
+        {
+            oss << "PERSONALITY_CONTEXT\n" << g_AmigoPersonalityName;
+            if (!g_AmigoPersonalityPrompt.empty()) oss << ": " << g_AmigoPersonalityPrompt;
+            oss << "\nUse personality only to choose among valid ways to pursue the current mission.\n\n";
         }
         oss << "LONG_TERM_GOAL\n";
         oss << longTermGoal << "\n\n";
@@ -3686,7 +4045,14 @@ Break the long-term goal into short-term goals, using STATE_SUMMARY for context.
         oss << BuildPlannerStateSummary(bot, world) << "\n\n";
         oss << "INSTRUCTIONS\n";
         oss << "Using LONG_TERM_GOAL (and STATE_SUMMARY/MEMORY for context), write exactly ONE short-term goal.\n";
-        oss << "- Prefer picking up nearby available quests, nearby quest objectives, and nearby quest turn-ins when possible.\n";
+        oss << "- Stay within the typed mission shown in STATE_SUMMARY.\n";
+        oss << "- SOCIAL_CONTEXT may influence how you pursue the mission, but cannot bypass mission scope or deterministic lifecycle ownership.\n";
+        if (g_AmigoGroupAuthority == "peer")
+            oss << "- Party membership or party leadership does not grant ownership. Group members are peers; only explicit temporary cooperative directives may affect follow/assist behavior.\n";
+        if (bot.mission.kind == BotMissionKind::Quest)
+            oss << "- Prefer picking up nearby available quests, nearby quest objectives, and nearby quest turn-ins when possible.\n";
+        if (bot.mission.kind == BotMissionKind::Gather || bot.mission.kind == BotMissionKind::Grind)
+            oss << "- Treat the named mission target as exact. Do not substitute a similar name.\n";
         oss << "- The short-term goal must be a single plain-text sentence.\n";
         oss << "- Make it specific: name quest(s), NPC(s), mob(s), item(s), and/or objective target(s).\n";
         oss << "- If the next step requires killing mobs, explicitly say to grind the relevant mobs.\n";
@@ -3705,8 +4071,12 @@ Break the long-term goal into short-term goals, using STATE_SUMMARY for context.
     {
         // Compose the control prompt with goal and tool rules.
         nlohmann::json stateJson = BuildSnapshotJson(bot, world, nullptr, LlmView::Control);
+        {
+            std::lock_guard<std::mutex> lock(gLatestControlStateMutex);
+            gLatestControlStateJson = stateJson.dump();
+        }
         const OllamaSettings settings = GetOllamaSettings();
-        const std::string &systemPrompt = GetPrompt(LLMRole::Control, settings);
+        std::string const& systemPrompt = GetPrompt(LLMRole::Control, settings);
         bool compact = UseCompactPromptFormat();
 
         std::string currentShortTermGoal = CurrentShortTermGoal(shortTermGoals, shortTermIndex);
@@ -3731,9 +4101,16 @@ You are a control-only executor.
 - Output exactly one <tool_call> block (or no output).
 - No extra text or JSON outside the tool call.
 - Use LT, ST, and S to choose a valid tool.
+- If S.bot.post_grind_decision is true, choose exactly one entry from S.bot.post_grind_options. Entries are server-generated and formatted as action | target | distance. Use request_talk_to_quest_giver(quest_id) for turn_in_quest entries, request_repair() for repair, request_vendor_sell() for sell_grays, and request_enter_grind() for continue_quest.
+- S.bot.mission is authoritative. Do not choose work outside it.
+- Named gather/grind mission targets are exact; never substitute a similar name.
+- For a named grind mission, use request_attack_target(entry_id) only for a nearby entity whose name exactly matches the mission target.
+- For a named gather mission, use request_gather_target(entry_id) only for a nearby game_object whose name exactly matches the mission target.
 - If S.bot.in_combat is true or S.bot.is_moving is true, call request_idle.
 - If S.quest_givers_in_range is not empty, prioritize request_talk_to_quest_giver.
-- If you need to interact with a quest giver/vendor/trainer but none are in range, use request_move_hop_npc(entry_id) to approach a relevant nearby NPC (S.nearby_entities where is_quest_giver/is_vendor/is_trainer/is_repair is true). Do not use it on random NPCs.
+- Recovery and loot are automatic. Service requests retain their own travel and interaction state. Choose request_vendor_sell, request_repair, or request_trainer when needed; the server handles approach and execution.
+- Taxi remains a strategic travel capability. Use it only at a matching nearby flight master.
+- Use request_move_hop_npc(entry_id) for mission-owned quest-giver or flight-master approach. Do not use it to micromanage lifecycle-owned vendor/repair/trainer travel.
 - Otherwise, prefer nearer quest objectives or nearer quest POIs when choosing movement.
 - If no control action is needed, call request_idle.
 )";
@@ -3756,11 +4133,18 @@ You are a control-only executor.
 - Output exactly one <tool_call> block (or no output).
 - No extra text or JSON outside the tool call.
 - Use LONG_TERM_GOAL, SHORT_TERM_GOAL, and STATE_JSON to choose a valid tool.
+- If STATE_JSON.bot.post_grind_decision is true, choose exactly one entry from STATE_JSON.bot.post_grind_options. Entries are server-generated and formatted as action | target | distance. Use request_talk_to_quest_giver(quest_id) for turn_in_quest entries, request_repair() for repair, request_vendor_sell() for sell_grays, and request_enter_grind() for continue_quest. Do not invent quest IDs or actions.
+- STATE_JSON.bot.mission is authoritative. Do not choose work outside it.
+- Named gather/grind mission targets are exact; never substitute a similar name.
+- For a named grind mission, use request_attack_target(entry_id) only for a nearby entity whose name exactly matches the mission target.
+- For a named gather mission, use request_gather_target(entry_id) only for a nearby game_object whose name exactly matches the mission target.
 - If STATE_JSON.bot.in_combat is true, call request_idle.
 - If STATE_JSON.bot.is_moving is true, call request_idle unless STATE_JSON.bot.grind_mode is true (in that case you may call request_stop_grind).
 - If STATE_JSON.bot.grind_mode is true and you need to travel/quest/talk, call request_stop_grind.
 - If STATE_JSON.quest_givers_in_range is not empty, prioritize request_talk_to_quest_giver.
-- If you need to interact with a quest giver/vendor/trainer but none are in range, use request_move_hop_npc(entry_id) to approach a relevant nearby NPC (STATE_JSON.nearby_entities where is_quest_giver/is_vendor/is_trainer/is_repair is true). Do not use it on random NPCs.
+- Recovery and loot are automatic. Service requests retain their own travel and interaction state. Choose request_vendor_sell, request_repair, or request_trainer when needed; the server handles approach and execution.
+- Taxi remains a strategic travel capability. Use it only at a matching nearby flight master.
+- Use request_move_hop_npc(entry_id) for mission-owned quest-giver or flight-master approach. Do not use it to micromanage lifecycle-owned vendor/repair/trainer travel.
 - If you intend to talk to a quest giver and your facing does not match its direction, use a turn tool first, then talk.
 - If working on incomplete quest objectives and relevant mobs are nearby, call request_enter_grind.
 - Otherwise, prefer nearer quest objectives or nearer quest POIs when choosing movement.
@@ -3789,28 +4173,28 @@ You are a control-only executor.
         return false;
     }
 
-    std::string NormalizeDirectionToken(std::string direction)
+    bool HasRemainingMissionObjective(BotSnapshot const& snapshot)
     {
-        // Accept synonyms and normalize to a single direction token.
-        direction = TrimCopy(direction);
-        std::transform(direction.begin(), direction.end(), direction.begin(), ::tolower);
-        if (direction == "forward" || direction == "forwards" || direction == "ahead" || direction == "up")
+        if (snapshot.mission.kind != BotMissionKind::Grind || snapshot.mission.target.empty())
+            return true;
+
+        bool foundMatchingObjective = false;
+        for (auto const& quest : snapshot.activeQuests)
         {
-            return "forward";
+            if (quest.status == QUEST_STATUS_COMPLETE)
+                return false;
+            for (auto const& objective : quest.objectives)
+            {
+                if (objective.targetName != snapshot.mission.target)
+                    continue;
+
+                foundMatchingObjective = true;
+                if (quest.status == QUEST_STATUS_INCOMPLETE && objective.current < objective.required)
+                    return true;
+            }
         }
-        if (direction == "backward" || direction == "backwards" || direction == "back" || direction == "down")
-        {
-            return "backward";
-        }
-        if (direction == "left" || direction == "leftward")
-        {
-            return "left";
-        }
-        if (direction == "right" || direction == "rightward")
-        {
-            return "right";
-        }
-        return "";
+
+        return !foundMatchingObjective;
     }
 
     bool TryParseNavCandidateIndex(std::string const &candidateId, size_t &outIndex)
@@ -3818,7 +4202,7 @@ You are a control-only executor.
         // Current candidate IDs are of the form "nav_<index>".
         // This helper is intentionally strict to avoid accidental acceptance of
         // geometry-bearing IDs.
-        constexpr const char *kPrefix = "nav_";
+        constexpr char const* kPrefix = "nav_";
         if (candidateId.rfind(kPrefix, 0) != 0)
         {
             return false;
@@ -4008,6 +4392,7 @@ You are a control-only executor.
         // exactly once when the delay expires.
         uint32 startupDelayUntilMs = 0;
         bool startupPlannerTriggered = false;
+        std::string configuredMissionSignature;
         std::string longTermGoal;
         std::vector<std::string> shortTermGoals;
         std::atomic<size_t> shortTermIndex{0};
@@ -4082,6 +4467,12 @@ static uint32 ConsumeLongTermPlannerRefresh(uint64 guid)
     return at;
 }
 
+std::string GetAmigoLatestControlStateJson()
+{
+    std::lock_guard<std::mutex> lock(gLatestControlStateMutex);
+    return gLatestControlStateJson;
+}
+
 OllamaBotControlLoop::OllamaBotControlLoop() : WorldScript("OllamaBotControlLoop") {}
 
 void RequestLongTermPlannerRefresh(uint64 guid, uint32 nowMs)
@@ -4101,29 +4492,10 @@ static void EnqueueStrategicUpdate(uint64 guid, PendingStrategicUpdate update)
     pendingStrategicUpdates[guid] = std::move(update);
 }
 
-std::string EscapeBracesForFmt(const std::string &input)
-{
-    // Double braces so fmt-style formatting doesn't consume JSON braces.
-    std::string output;
-    output.reserve(input.size() * 2);
-
-    for (char c : input)
-    {
-        if (c == '{' || c == '}')
-        {
-            output.push_back(c);
-            output.push_back(c);
-        }
-        else
-        {
-            output.push_back(c);
-        }
-    }
-    return output;
-}
-
 void OllamaBotControlLoop::OnUpdate(uint32 diff)
 {
+    // Deliver worker completions on the world thread before reading live bot state.
+    AmigoLlmDispatchDrainCompletions();
     // Main update loop: manage LLM planning and control per bot.
     if (!g_OllamaBotRuntime.enable_control)
     {
@@ -4164,6 +4536,10 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 continue;
         }
 
+        // Autonomous login uses Playerbots' random-bot path. Remove its
+        // background movement before Amigo evaluates the next control action.
+        SuppressAutonomousMovement(bot, ai);
+
         uint32 nowMs = getMSTime();
         uint64 guid = bot->GetGUID().GetRawValue();
         auto &statePtr = botStates[guid];
@@ -4194,6 +4570,27 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             statePtr->nextStrategicAllowedMs.store(delayUntilMs, std::memory_order_relaxed);
         }
         LlmBotState &state = *statePtr;
+
+        BotMission configuredMission = BuildConfiguredMission();
+        std::string configuredSignature = MissionSignature(configuredMission);
+        if (state.configuredMissionSignature != configuredSignature)
+        {
+            BotMissionState currentMission = BotMissionRegistry::Instance().Get(guid);
+            std::string currentSignature = MissionSignature(currentMission.mission);
+            if (currentSignature != configuredSignature)
+            {
+                uint64 revision = BotMissionRegistry::Instance().Replace(guid, configuredMission);
+                state.forceStrategic.store(true, std::memory_order_relaxed);
+                state.forceControl.store(false, std::memory_order_relaxed);
+                state.longTermGoal.clear();
+                state.shortTermGoals.clear();
+                state.shortTermIndex.store(0, std::memory_order_relaxed);
+                state.hasStrategicResult = false;
+                LOG_INFO("server.loading", "[OllamaBotAmigo] Mission assigned for {}: kind={} target='{}' role='{}' revision={}",
+                         bot->GetName(), configuredMission.KindName(), configuredMission.target, configuredMission.role, revision);
+            }
+            state.configuredMissionSignature = configuredSignature;
+        }
 
         // Tick movement first; travel completion is checked every tick.
         state.movement.Update(diff);
@@ -4338,6 +4735,18 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             continue;
         }
 
+        // Deterministic lifecycle work runs before every LLM pause/cooldown gate.
+        // Existing Amigo movement/profession operations are allowed to finish, then
+        // Needs/Maintenance can own execution without rewriting BotMission.
+        {
+            BotMissionState lifecycleMission = BotMissionRegistry::Instance().Get(guid);
+            const bool optionalMaintenanceWindow = !bot->IsInCombat() &&
+                                                   !bot->isMoving() &&
+                                                   !state.travel.Active();
+            if (ServiceDeterministicLifecycle(bot, ai, lifecycleMission.revision, optionalMaintenanceWindow))
+                continue;
+        }
+
         if (state.promptInFlight.load(std::memory_order_relaxed))
         {
             continue;
@@ -4444,6 +4853,9 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
         }
         if (newlyCompletedQuest)
         {
+            // Ask the control model for the next bounded action immediately.
+            // The snapshot will contain the server-generated post-grind options.
+            state.forceControl.store(true, std::memory_order_relaxed);
             state.forceStrategic.store(true, std::memory_order_relaxed);
             state.nextPlannerShortTickMs.store(nowMs, std::memory_order_relaxed);
             state.nextPlannerLongTickMs.store(nowMs, std::memory_order_relaxed);
@@ -4554,6 +4966,20 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
 
         if (hasStrategicUpdate && strategicUpdate.hasUpdate)
         {
+            if (!BotMissionRegistry::Instance().RevisionMatches(guid, strategicUpdate.missionRevision))
+            {
+                LOG_INFO("server.loading", "[OllamaBotAmigo] Discarded stale planner result for {}: mission revision {} no longer current", bot->GetName(), strategicUpdate.missionRevision);
+                hasStrategicUpdate = false;
+            }
+            else if (GetBotLifecycleGeneration(guid) != strategicUpdate.lifecycleGeneration)
+            {
+                LOG_INFO("server.loading", "[OllamaBotAmigo] Discarded stale planner result for {}: lifecycle generation {} no longer current", bot->GetName(), strategicUpdate.lifecycleGeneration);
+                hasStrategicUpdate = false;
+            }
+        }
+
+        if (hasStrategicUpdate && strategicUpdate.hasUpdate)
+        {
             std::string previousLongTermGoalForHistory = state.longTermGoal;
             bool hasLongTermGoal = !state.longTermGoal.empty();
             bool canGenerateGoal = true;
@@ -4657,7 +5083,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             bool runLongTerm = longTermDue;
             bool runShortTerm = shortTermDue;
 
-            std::thread([guid, snapshot, world, botName, previousLongTermGoal, hasShortTermGoals, stateRef, runLongTerm, runShortTerm]()
+            if (!AmigoLlmDispatchSubmit([guid, snapshot, world, botName, previousLongTermGoal, hasShortTermGoals, stateRef, runLongTerm, runShortTerm]()
                         {
                             // Planner worker thread.
                             bool loggedSummary = false;
@@ -4665,7 +5091,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                                 stateRef->strategicBusy.store(false);
                                 stateRef->promptInFlight.store(false, std::memory_order_relaxed);
                             };
-                            auto rejectAndBackoff = [&](const char* msg) {
+                            auto rejectAndBackoff = [&](char const* msg) {
                                 bool expected = false;
                                 if (stateRef->loggedStrategicParseError.compare_exchange_strong(expected, true))
                                 {
@@ -4676,7 +5102,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                                 stateRef->nextPlannerLongTickMs.store(now + kPlannerFailureDelayMs, std::memory_order_relaxed);
                                 clearBusy();
                             };
-                            auto rejectAndBackoffShort = [&](const char* msg)
+                            auto rejectAndBackoffShort = [&](char const* msg)
                             {
                                 bool expected = false;
                                 if (stateRef->loggedStrategicParseError.compare_exchange_strong(expected, true))
@@ -4687,29 +5113,9 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                                 clearBusy();
                             };
 
-                            auto rejectAndBackoffLong = [&](const char* msg)
-                            {
-                                bool expected = false;
-                                if (stateRef->loggedStrategicParseError.compare_exchange_strong(expected, true))
-                                    LOG_ERROR("server.loading", "[OllamaBotAmigo] Planner reply rejected: {}.", msg);
-
-                                uint32 now = getMSTime();
-                                stateRef->nextPlannerLongTickMs.store(now + GetPlannerLongTermDelayMs(), std::memory_order_relaxed);
-                                clearBusy();
-                            };
-
-                            auto rejectAndBackoffBoth = [&](const char* msg)
-                            {
-                                bool expected = false;
-                                if (stateRef->loggedStrategicParseError.compare_exchange_strong(expected, true))
-                                    LOG_ERROR("server.loading", "[OllamaBotAmigo] Planner reply rejected: {}.", msg);
-
-                                uint32 now = getMSTime();
-                                stateRef->nextPlannerShortTickMs.store(now + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
-                                stateRef->nextPlannerLongTickMs.store(now + GetPlannerLongTermDelayMs(), std::memory_order_relaxed);
-                                clearBusy();
-                            };
                             PendingStrategicUpdate update;
+                            update.missionRevision = snapshot.missionRevision;
+                            update.lifecycleGeneration = snapshot.lifecycleGeneration;
 
                             // If only short-term goals are due, reuse the existing long-term goal and refresh short-term goals only.
                             std::string longTermGoal;
@@ -4725,7 +5131,21 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                             else
                             {
                                 // Long-term planning path (also refreshes short-term goals).
-                                if (!g_OllamaBotControlForcedLongTermGoal.empty())
+                                // Explicit typed missions own semantic intent. The LLM may decompose
+                                // them, but it may not replace them with a different activity.
+                                if (snapshot.mission.kind != BotMissionKind::Quest)
+                                {
+                                    longTermGoal = snapshot.mission.PlannerGoal();
+                                    if (longTermGoal.empty())
+                                    {
+                                        rejectAndBackoff("typed mission has no target");
+                                        return;
+                                    }
+                                    update.plan.longTermGoal = longTermGoal;
+                                    update.hasUpdate = true;
+                                    needsShortTermGoals = !hasShortTermGoals || longTermGoal != previousLongTermGoal;
+                                }
+                                else if (!g_OllamaBotControlForcedLongTermGoal.empty())
                                 {
                                     longTermGoal = g_OllamaBotControlForcedLongTermGoal;
 
@@ -4746,13 +5166,12 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                                     AppendPlannerStateSummary(botName, summary);
                                     loggedSummary = true;
                                     std::string longTermPrompt = BuildPlannerLongTermPrompt(snapshot, world, std::string());
-                                    std::string longTermReply = QueryOllamaLLMOnce(longTermPrompt, g_OllamaBotControlPlannerLongTermModel);
+                                    std::string longTermReply = QueryOllamaLLMOnce(longTermPrompt, g_OllamaBotControlPlannerLongTermModel, g_AmigoThinkPlanner);
                                     std::string longTermDraft = ExtractPlannerSentence(longTermReply);
 
                                     if (g_EnableOllamaBotAmigoDebug || g_EnableOllamaBotPlannerDebug)
                                     {
-                                        std::string safeReply = EscapeBracesForFmt(longTermReply);
-                                        LOG_INFO("server.loading", "[OllamaBotAmigo] Planner long-term draft for '{}':{}", botName, safeReply);
+                                        LOG_INFO("server.loading", "[OllamaBotAmigo] Planner long-term draft for '{}':{}", botName, longTermReply);
                                     }
 
                                     if (longTermDraft.empty())
@@ -4771,13 +5190,12 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                                     }
 
                                     std::string reviewPrompt = BuildLongTermGoalReviewPrompt(snapshot, world, longTermDraft);
-                                    std::string reviewReply = QueryOllamaLLMOnce(reviewPrompt, g_OllamaBotControlPlannerLongTermModel);
+                                    std::string reviewReply = QueryOllamaLLMOnce(reviewPrompt, g_OllamaBotControlPlannerLongTermModel, g_AmigoThinkPlanner);
                                     longTermGoal = ExtractPlannerSentence(reviewReply);
 
                                     if (g_EnableOllamaBotAmigoDebug || g_EnableOllamaBotPlannerDebug)
                                     {
-                                        std::string safeReply = EscapeBracesForFmt(reviewReply);
-                                        LOG_INFO("server.loading", "[OllamaBotAmigo] Planner long-term review for '{}':\\n{}", botName, safeReply);
+                                        LOG_INFO("server.loading", "[OllamaBotAmigo] Planner long-term review for '{}':\\n{}", botName, reviewReply);
                                     }
 
                                     if (longTermGoal.empty())
@@ -4816,12 +5234,11 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                                     focusQuestBlock = BuildFocusQuestBlock(*focusQuest);
                                 }
                                 std::string shortTermPrompt = BuildPlannerShortTermPrompt(snapshot, world, std::string(), longTermGoal, focusQuestBlock);
-                                std::string shortTermReply = QueryOllamaLLMOnce(shortTermPrompt, g_OllamaBotControlPlannerShortTermModel);
+                                std::string shortTermReply = QueryOllamaLLMOnce(shortTermPrompt, g_OllamaBotControlPlannerShortTermModel, g_AmigoThinkPlanner);
 
                                 if (g_EnableOllamaBotAmigoDebug || g_EnableOllamaBotPlannerDebug)
                                 {
-                                    std::string safeReply = EscapeBracesForFmt(shortTermReply);
-                                    LOG_INFO("server.loading", "[OllamaBotAmigo] Planner short-term goals for '{}':\\n{}", botName, safeReply);
+                                    LOG_INFO("server.loading", "[OllamaBotAmigo] Planner short-term goals for '{}':\\n{}", botName, shortTermReply);
                                 }
 
                                     std::string goal = ParseShortTermGoal(shortTermReply);
@@ -4838,7 +5255,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                                     }
                                     update.plan.shortTermGoals = {goal};
                                     update.refreshedShortTermGoals = true;
-	                            }
+                                }
 
                             // Schedule next planner ticks (separate long vs short intervals).
                             uint32 nowTick = getMSTime();
@@ -4849,9 +5266,23 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                             }
 
                             stateRef->loggedStrategicParseError.store(false);
-                            EnqueueStrategicUpdate(guid, std::move(update));
-                            clearBusy(); })
-                .detach();
+                            if (BotMissionRegistry::Instance().RevisionMatches(guid, update.missionRevision) &&
+                                GetBotLifecycleGeneration(guid) == update.lifecycleGeneration)
+                            {
+                                EnqueueStrategicUpdate(guid, std::move(update));
+                            }
+                            else
+                            {
+                                LOG_INFO("server.loading", "[OllamaBotAmigo] Planner result became stale before enqueue for '{}' (mission revision {}, lifecycle generation {})", botName, update.missionRevision, update.lifecycleGeneration);
+                            }
+                            clearBusy(); }))
+            {
+                stateRef->strategicBusy.store(false, std::memory_order_release);
+                stateRef->promptInFlight.store(false, std::memory_order_relaxed);
+                stateRef->nextPlannerShortTickMs.store(getMSTime() + kPlannerFailureDelayMs, std::memory_order_relaxed);
+                stateRef->nextPlannerLongTickMs.store(getMSTime() + kPlannerFailureDelayMs, std::memory_order_relaxed);
+                LOG_INFO("server.loading", "[OllamaBotAmigo] Planner request dropped for '{}' because the bounded LLM queue is full.", botName);
+            }
         }
         // HARD WAIT: if a control request is in flight for this bot, do nothing this tick.
         if (state.controlBusy.load(std::memory_order_relaxed))
@@ -4862,6 +5293,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
         }
 
         bool forceControl = state.forceControl.load(std::memory_order_relaxed);
+
         if (!g_EnableOllamaBotControl || state.shortTermGoals.empty() ||
             (!forceControl && !state.scheduler.ShouldRunControl(nowMs, guid)))
         {
@@ -4919,7 +5351,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             std::shared_ptr<LlmBotState> stateRef = statePtr;
             size_t shortTermGoalCount = state.shortTermGoals.size();
 
-            std::thread([guid, prompt, botName, snapshot, isStopped, stateRef, shortTermGoalCount]()
+            if (!AmigoLlmDispatchSubmit([guid, prompt, botName, snapshot, isStopped, stateRef, shortTermGoalCount]()
                         {
                 // Control worker thread that parses tool calls.
                 // SINGLE EXIT: all paths funnel through this guard
@@ -4963,7 +5395,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     clearBusy();
                 };
 
-                std::string llmReply = QueryOllamaLLMOnce(prompt, g_OllamaBotControlControlModel);
+                std::string llmReply = QueryOllamaLLMOnce(prompt, g_OllamaBotControlControlModel, g_AmigoThinkControl);
 
                 // If cURL fails, QueryOllamaLLMOnce returns an empty string.
                 // Apply exponential backoff to avoid hammering.
@@ -4974,6 +5406,8 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 }
 
                 ControlActionState actionState;
+                actionState.missionRevision = snapshot.missionRevision;
+                actionState.lifecycleGeneration = snapshot.lifecycleGeneration;
                 bool hasAction = false;
                 std::string trimmed = llmReply;
                 size_t start = trimmed.find_first_not_of(" \t\r\n");
@@ -5010,8 +5444,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
 
                 if (g_EnableOllamaBotAmigoDebug || g_EnableOllamaBotControlDebug)
                 {
-                    std::string safeJson = EscapeBracesForFmt(llmReply);
-                    LOG_INFO("server.loading", "[OllamaBotAmigo] Control LLM reply for '{}':\n{}", botName, safeJson);
+                    LOG_INFO("server.loading", "[OllamaBotAmigo] Control LLM reply for '{}':\n{}", botName, llmReply);
                 }
 
                 ControlToolDefinition definition;
@@ -5037,6 +5470,17 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
 
                 std::string gateReason = "allowed";
                 bool accepted = false;
+                std::string missionGateReason;
+                if (!MissionAllowsControlCapability(snapshot.mission, definition.capability, missionGateReason,
+                                                    snapshot.postGrindDecision))
+                {
+                    LogControlToolRejected(toolCall.name, missionGateReason);
+                    stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                    stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                    clearBusy();
+                    return;
+                }
+
                 ControlAction action;
                 action.capability = definition.capability;
 
@@ -5202,7 +5646,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                         if (e.type == "npc" && e.entryId == entryId)
                         {
                             found = true;
-                            actionable = e.isQuestGiver || e.isVendor || e.isTrainer || e.isRepair;
+                            actionable = e.isQuestGiver || e.isVendor || e.isTrainer || e.isRepair || e.isFlightMaster;
                             break;
                         }
                     }
@@ -5239,6 +5683,84 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     accepted = true;
                     gateReason = "nearby_npc";
                 }
+                else if (definition.capability == ControlAction::Capability::EnterAttackPull)
+                {
+                    if (!HasRemainingMissionObjective(snapshot))
+                    {
+                        LogControlToolRejected(toolCall.name, "mission_objective_complete");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    uint32 entryId = 0;
+                    if (!ParseEntryIdArguments(toolCall.arguments, entryId))
+                    {
+                        LogControlToolRejected(toolCall.name, "invalid_arguments");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    bool foundExactTarget = false;
+                    for (auto const& entity : snapshot.nearbyEntities)
+                    {
+                        if (entity.entryId == entryId && snapshot.mission.MatchesTargetName(entity.name))
+                        {
+                            foundExactTarget = true;
+                            break;
+                        }
+                    }
+                    if (!foundExactTarget)
+                    {
+                        LogControlToolRejected(toolCall.name, "mission_target_mismatch");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    action.npcEntryId = entryId;
+                    accepted = true;
+                    gateReason = "exact_mission_target";
+                }
+                else if (definition.capability == ControlAction::Capability::GatherTarget)
+                {
+                    uint32 entryId = 0;
+                    if (!ParseEntryIdArguments(toolCall.arguments, entryId))
+                    {
+                        LogControlToolRejected(toolCall.name, "invalid_arguments");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    bool foundExactTarget = false;
+                    for (auto const& entity : snapshot.nearbyEntities)
+                    {
+                        if (entity.type == "game_object" && entity.entryId == entryId &&
+                            snapshot.mission.MatchesTargetName(entity.name))
+                        {
+                            foundExactTarget = true;
+                            break;
+                        }
+                    }
+                    if (!foundExactTarget)
+                    {
+                        LogControlToolRejected(toolCall.name, "mission_target_mismatch");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    action.gameObjectEntryId = entryId;
+                    accepted = true;
+                    gateReason = "exact_gather_target";
+                }
                 else if (definition.capability == ControlAction::Capability::EnterGrind)
                 {
                     if (snapshot.grindMode)
@@ -5264,19 +5786,6 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     }
                     accepted = true;
                     gateReason = "stop_grind";
-                }
-                else if (definition.capability == ControlAction::Capability::EnterGrind)
-                {
-                    if (snapshot.inCombat)
-                    {
-                        LogControlToolRejected(toolCall.name, "in_combat");
-                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
-                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
-                        clearBusy();
-                        return;
-                    }
-                    accepted = true;
-                    gateReason = "out_of_combat";
                 }
                 else if (definition.capability == ControlAction::Capability::Stay)
                 {
@@ -5326,6 +5835,77 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     action.questId = questId;
                     accepted = true;
                     gateReason = "quest_giver_in_range";
+                }
+                else if (definition.capability == ControlAction::Capability::VendorSell ||
+                         definition.capability == ControlAction::Capability::VendorBuyUseful ||
+                         definition.capability == ControlAction::Capability::Repair ||
+                         definition.capability == ControlAction::Capability::Trainer ||
+                         definition.capability == ControlAction::Capability::Taxi ||
+                         definition.capability == ControlAction::Capability::Hearthstone ||
+                         definition.capability == ControlAction::Capability::Loot ||
+                         definition.capability == ControlAction::Capability::Food ||
+                         definition.capability == ControlAction::Capability::Drink ||
+                         definition.capability == ControlAction::Capability::Maintenance)
+                {
+                    if (snapshot.inCombat)
+                    {
+                        LogControlToolRejected(toolCall.name, "in_combat");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    if (snapshot.isMoving)
+                    {
+                        LogControlToolRejected(toolCall.name, "already_moving");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    bool requiresNpc = false;
+                    bool matchingNpc = false;
+                    for (auto const& entity : snapshot.nearbyEntities)
+                    {
+                        if (entity.type != "npc")
+                            continue;
+
+                        if (definition.capability == ControlAction::Capability::VendorSell ||
+                            definition.capability == ControlAction::Capability::VendorBuyUseful)
+                        {
+                            requiresNpc = true;
+                            matchingNpc = matchingNpc || entity.isVendor;
+                        }
+                        else if (definition.capability == ControlAction::Capability::Repair)
+                        {
+                            requiresNpc = true;
+                            matchingNpc = matchingNpc || entity.isRepair;
+                        }
+                        else if (definition.capability == ControlAction::Capability::Trainer)
+                        {
+                            requiresNpc = true;
+                            matchingNpc = matchingNpc || entity.isTrainer;
+                        }
+                        else if (definition.capability == ControlAction::Capability::Taxi)
+                        {
+                            requiresNpc = true;
+                            matchingNpc = matchingNpc || entity.isFlightMaster;
+                        }
+                    }
+
+                    if (requiresNpc && !matchingNpc)
+                    {
+                        LogControlToolRejected(toolCall.name, "required_service_npc_not_nearby");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
+
+                    accepted = true;
+                    gateReason = "native_playerbots_service";
                 }
                 else if (definition.capability == ControlAction::Capability::Fish)
                 {
@@ -5495,7 +6075,15 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                         size_t nextIndex = (currentIndex + 1) % shortTermGoalCount;
                         stateRef->shortTermIndex.store(nextIndex, std::memory_order_relaxed);
                     }
-                    ControlActionRegistry::Instance().Enqueue(guid, actionState);
+                    if (BotMissionRegistry::Instance().RevisionMatches(guid, actionState.missionRevision) &&
+                        GetBotLifecycleGeneration(guid) == actionState.lifecycleGeneration)
+                    {
+                        ControlActionRegistry::Instance().Enqueue(guid, actionState);
+                    }
+                    else
+                    {
+                        LOG_INFO("server.loading", "[OllamaBotAmigo] Discarded stale control result for '{}' (mission revision {}, lifecycle generation {})", botName, actionState.missionRevision, actionState.lifecycleGeneration);
+                    }
                 }
                 if (!hasAction)
                 {
@@ -5505,7 +6093,14 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 // Clear busy ONLY here (response thread).
                 stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
                 clearBusy();
-            }).detach();
+            }))
+            {
+                stateRef->controlBusy.store(false, std::memory_order_release);
+                stateRef->promptInFlight.store(false, std::memory_order_relaxed);
+                stateRef->controlState.store(LlmBotState::ControlState::FailureHold, std::memory_order_relaxed);
+                stateRef->nextAllowedAttemptMs.store(getMSTime() + kOllamaBaseCooldownMs, std::memory_order_relaxed);
+                LOG_INFO("server.loading", "[OllamaBotAmigo] Control request dropped for '{}' because the bounded LLM queue is full.", botName);
+            }
         }
     }
 

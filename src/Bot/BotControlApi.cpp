@@ -5,8 +5,11 @@
 #include "Bot/BotMovement.h"
 #include "Util/WorldChecks.h"
 #include "Bot/BotTravel.h"
+#include "Bot/BotMission.h"
+#include "Bot/BotLifecycle.h"
 #include "Db/BotMemory.h"
 #include "Util/PlayerbotsCompat.h"
+#include "Event.h"
 #include "Creature.h"
 #include "DatabaseEnv.h"
 #include "ObjectAccessor.h"
@@ -107,7 +110,10 @@ namespace
             return false;
         }
 
-        Player* sender = ai->GetMaster() ? ai->GetMaster() : bot;
+        // Amigo's internal commands are self-issued. Never impersonate the
+        // Playerbots master pointer: group membership or a temporary peer
+        // directive must not become command authority.
+        Player* sender = bot;
         BotState strategyState = BOT_STATE_NON_COMBAT;
         const bool isStrategy = IsStrategyCommand(command, strategyState);
         if (isStrategy)
@@ -139,7 +145,7 @@ namespace
         return true;
     }
 
-    std::string BuildActionKey(const BotControlCommand& command)
+    std::string BuildActionKey(BotControlCommand const& command)
     {
         // Build a key that is stable across retries for stuck-memory tracking.
         switch (command.type)
@@ -154,6 +160,8 @@ namespace
                 return key.str();
             }
             case BotControlCommandType::PlayerbotCommand:
+            case BotControlCommandType::PlayerbotAction:
+            case BotControlCommandType::PlayerbotStrategy:
             {
                 if (!command.args.empty())
                 {
@@ -162,7 +170,9 @@ namespace
                     {
                         action.resize(120);
                     }
-                    return "command:" + action;
+                    char const* prefix = command.type == BotControlCommandType::PlayerbotAction ? "action:" :
+                                         command.type == BotControlCommandType::PlayerbotStrategy ? "strategy:" : "command:";
+                    return std::string(prefix) + action;
                 }
                 break;
             }
@@ -172,7 +182,7 @@ namespace
         return "";
     }
 
-    void RecordStuckAttempt(uint64 botGuid, const std::string& actionKey)
+    void RecordStuckAttempt(uint64 botGuid, std::string const& actionKey)
     {
         // Increment attempt counts for actions that fail to apply.
         if (!g_EnableAmigoStuckMemory || actionKey.empty())
@@ -182,7 +192,7 @@ namespace
             memory->RecordFailure(actionKey, FailureType::Retryable, getMSTime());
     }
 
-    void ClearStuckAttempt(uint64 botGuid, const std::string& actionKey)
+    void ClearStuckAttempt(uint64 botGuid, std::string const& actionKey)
     {
         // Remove the stuck record once a command succeeds.
         if (!g_EnableAmigoStuckMemory || actionKey.empty())
@@ -200,64 +210,20 @@ namespace
             return "";
         }
 
-        if (creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_VENDOR))
+        if (creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR))
         {
             return "vendor";
         }
-        if (creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_TRAINER))
+        if (creature->HasNpcFlag(UNIT_NPC_FLAG_TRAINER))
         {
             return "trainer";
         }
-        if (creature->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_REPAIR))
+        if (creature->HasNpcFlag(UNIT_NPC_FLAG_REPAIR))
         {
             return "repair";
         }
 
         return "";
-    }
-
-    Creature* FindNearestHostileCreature(Player* bot, PlayerbotAI* ai)
-    {
-        // Pick the closest hostile NPC to auto-select for attack pull.
-        if (!bot || !ai)
-        {
-            return nullptr;
-        }
-
-        AiObjectContext* context = ai->GetAiObjectContext();
-        if (!context)
-        {
-            return nullptr;
-        }
-
-        Creature* best = nullptr;
-        float bestDistance = 0.0f;
-        GuidVector npcs = context->GetValue<GuidVector>("nearest npcs")->Get();
-        for (ObjectGuid const& guid : npcs)
-        {
-            Creature* creature = ai->GetCreature(guid);
-            if (!creature)
-            {
-                continue;
-            }
-            if (!creature->IsAlive())
-            {
-                continue;
-            }
-            if (!creature->IsHostileTo(bot))
-            {
-                continue;
-            }
-
-            float distance = bot->GetDistance(creature);
-            if (!best || distance < bestDistance)
-            {
-                best = creature;
-                bestDistance = distance;
-            }
-        }
-
-        return best;
     }
 
     void RememberVendorFromSelectedTarget(Player* bot)
@@ -302,6 +268,73 @@ namespace
     }
 }
 
+bool ExecutePlayerbotAction(Player* bot, std::string const& action, std::string const& qualifier)
+{
+    if (!bot || action.empty())
+    {
+        return false;
+    }
+
+    PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!ai)
+    {
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Direct Playerbots action rejected: no PlayerbotAI for {}", bot->GetName());
+        return false;
+    }
+
+    if (action == "attack selected target")
+    {
+        Unit* target = bot->GetSelectedUnit();
+        if (!target || !target->IsInWorld() || !target->IsAlive() || !bot->IsValidAttackTarget(target))
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Selected-target attack rejected for {}: invalid target",
+                     bot->GetName());
+            return false;
+        }
+
+        if (bot->IsInCombat() && bot->GetVictim() == target)
+        {
+            return true;
+        }
+
+        AiObjectContext* context = ai->GetAiObjectContext();
+        if (!context)
+        {
+            return false;
+        }
+
+        context->GetValue<Unit*>("current target")->Set(target);
+        context->GetValue<GuidVector>("prioritized targets")->Set({ target->GetGUID() });
+        bool const ok = ai->DoSpecificAction("melee", Event("ollama_bot_amigo", qualifier, bot), true, qualifier);
+        if (ok)
+        {
+            ai->ChangeEngine(BOT_STATE_COMBAT);
+        }
+
+        if (g_EnableOllamaBotAmigoDebug)
+        {
+            LOG_INFO("server.loading",
+                     "[OllamaBotAmigo] Selected-target attack '{}' for {}",
+                     ok ? "succeeded" : "failed",
+                     bot->GetName());
+        }
+        return ok;
+    }
+
+    // Use the bot as event owner. Actions such as "pull my target" then read
+    // the bot's selected target without requiring a human master.
+    const bool ok = ai->DoSpecificAction(action, Event("ollama_bot_amigo", qualifier, bot), true, qualifier);
+    if (g_EnableOllamaBotAmigoDebug)
+    {
+        LOG_INFO("server.loading",
+                 "[OllamaBotAmigo] Direct Playerbots action '{}'{} for {}",
+                 action,
+                 ok ? " succeeded" : " failed",
+                 bot->GetName());
+    }
+    return ok;
+}
+
 bool ResolveCapabilityCommand(ControlAction::Capability capability,
     BotControlCommand& outCommand,
     std::string& outCommandText)
@@ -310,46 +343,116 @@ bool ResolveCapabilityCommand(ControlAction::Capability capability,
     outCommand = BotControlCommand{};
     outCommandText.clear();
 
-    // TODO: keep capability mappings in sync with Playerbots command handler strategy.
     switch (capability)
     {
         case ControlAction::Capability::EnterGrind:
-            outCommandText = "grind";
-            break;
+            // Native equivalent of Playerbots' GrindChatShortcutAction.
+            outCommand.type = BotControlCommandType::PlayerbotStrategy;
+            outCommand.args = { "nc:+grind,-passive,-stay" };
+            outCommandText = "strategy nc:+grind,-passive,-stay";
+            return true;
         case ControlAction::Capability::StopGrind:
-            outCommandText = "follow";
-            break;
+            // Native equivalent of Playerbots' FollowChatShortcutAction strategy changes.
+            outCommand.type = BotControlCommandType::PlayerbotStrategy;
+            outCommand.args = {
+                "nc:+follow,-passive,-grind,-move from group",
+                "co:-stay,-follow,-passive,-grind,-move from group"
+            };
+            outCommandText = "strategy follow/stop-grind";
+            return true;
         case ControlAction::Capability::Stay:
-            outCommandText = "stay";
-            break;
+            // Native equivalent of Playerbots' StayChatShortcutAction strategy changes.
+            outCommand.type = BotControlCommandType::PlayerbotStrategy;
+            outCommand.args = {
+                "nc:+stay,-passive,-move from group",
+                "co:+stay,-follow,-passive,-move from group"
+            };
+            outCommandText = "strategy stay";
+            return true;
         case ControlAction::Capability::Unstay:
-            outCommandText = "nc -stay";
-            break;
+            outCommand.type = BotControlCommandType::PlayerbotStrategy;
+            outCommand.args = { "nc:-stay", "co:-stay" };
+            outCommandText = "strategy -stay";
+            return true;
+        case ControlAction::Capability::VendorSell:
+            outCommand.type = BotControlCommandType::PlayerbotAction;
+            outCommand.args = { "sell", "vendor" };
+            outCommandText = "action sell(vendor)";
+            return true;
+        case ControlAction::Capability::VendorBuyUseful:
+            outCommand.type = BotControlCommandType::PlayerbotAction;
+            outCommand.args = { "buy", "vendor" };
+            outCommandText = "action buy(vendor)";
+            return true;
+        case ControlAction::Capability::Repair:
+            outCommand.type = BotControlCommandType::PlayerbotAction;
+            outCommand.args = { "repair" };
+            outCommandText = "action repair";
+            return true;
+        case ControlAction::Capability::Trainer:
+            outCommand.type = BotControlCommandType::PlayerbotAction;
+            outCommand.args = { "trainer" };
+            outCommandText = "action trainer";
+            return true;
+        case ControlAction::Capability::Hearthstone:
+            outCommand.type = BotControlCommandType::PlayerbotAction;
+            outCommand.args = { "hearthstone" };
+            outCommandText = "action hearthstone";
+            return true;
+        case ControlAction::Capability::Taxi:
+            outCommand.type = BotControlCommandType::PlayerbotAction;
+            outCommand.args = { "taxi" };
+            outCommandText = "action taxi";
+            return true;
+        case ControlAction::Capability::Loot:
+            outCommand.type = BotControlCommandType::PlayerbotAction;
+            outCommand.args = { "loot" };
+            outCommandText = "action loot";
+            return true;
+        case ControlAction::Capability::Food:
+            outCommand.type = BotControlCommandType::PlayerbotAction;
+            outCommand.args = { "food" };
+            outCommandText = "action food";
+            return true;
+        case ControlAction::Capability::Drink:
+            outCommand.type = BotControlCommandType::PlayerbotAction;
+            outCommand.args = { "drink" };
+            outCommandText = "action drink";
+            return true;
+        case ControlAction::Capability::Maintenance:
+            outCommand.type = BotControlCommandType::PlayerbotAction;
+            outCommand.args = { "maintenance" };
+            outCommandText = "action maintenance";
+            return true;
         case ControlAction::Capability::TalkToQuestGiver:
+            // Playerbots' chat "talk" trigger fans out into gossip and quest packet actions.
+            // Keep this as a command fallback until we can provide those packet events directly.
+            outCommand.type = BotControlCommandType::PlayerbotCommand;
             outCommandText = "talk";
-            break;
+            outCommand.args = { outCommandText };
+            return true;
         case ControlAction::Capability::TurnLeft90:
-            // Rotate left by 90 degrees via Playerbot command.
+            // No registered direct Playerbots action exists for these chat-only turn helpers.
+            outCommand.type = BotControlCommandType::PlayerbotCommand;
             outCommandText = "turnleft";
-            break;
+            outCommand.args = { outCommandText };
+            return true;
         case ControlAction::Capability::TurnRight90:
-            // Rotate right by 90 degrees via Playerbot command.
+            outCommand.type = BotControlCommandType::PlayerbotCommand;
             outCommandText = "turnright";
-            break;
+            outCommand.args = { outCommandText };
+            return true;
         case ControlAction::Capability::TurnAround:
-            // Rotate 180 degrees via Playerbot command.
+            outCommand.type = BotControlCommandType::PlayerbotCommand;
             outCommandText = "turnaround";
-            break;
+            outCommand.args = { outCommandText };
+            return true;
         case ControlAction::Capability::Idle:
         case ControlAction::Capability::MoveHop:
         case ControlAction::Capability::MoveHopNpc:
         default:
             return false;
     }
-
-    outCommand.type = BotControlCommandType::PlayerbotCommand;
-    outCommand.args = { outCommandText };
-    return true;
 }
 
 void PollPendingStrategyLogs(Player* bot)
@@ -387,7 +490,7 @@ void PollPendingStrategyLogs(Player* bot)
     }
 }
 
-bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
+bool HandleBotControlCommand(Player* bot, BotControlCommand const& command)
 {
     // Execute an immediate command (move hop or raw Playerbot instruction).
     if (!bot)
@@ -468,41 +571,70 @@ bool HandleBotControlCommand(Player* bot, const BotControlCommand& command)
 
     return true;
 }
-case BotControlCommandType::PlayerbotCommand:
-
+case BotControlCommandType::PlayerbotAction:
         {
-            // Forward raw command to Playerbot AI (with special-case attack pull).
+            if (command.args.empty())
+            {
+                return false;
+            }
+            const std::string qualifier = command.args.size() > 1 ? command.args[1] : std::string();
+            return ExecutePlayerbotAction(bot, command.args[0], qualifier);
+        }
+case BotControlCommandType::PlayerbotStrategy:
+        {
             if (command.args.empty())
             {
                 return false;
             }
 
-            if (command.args[0] == "co +pull")
+            PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+            if (!ai)
             {
-                PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
-                if (!ai)
+                LOG_INFO("server.loading", "[OllamaBotAmigo] Strategy change rejected: no PlayerbotAI for {}", bot->GetName());
+                return false;
+            }
+
+            bool changed = false;
+            for (std::string const& spec : command.args)
+            {
+                if (spec.size() < 4 || spec[2] != ':')
                 {
-                    LOG_INFO("server.loading", "[OllamaBotAmigo] Attack pull rejected (reason=no_ai) for {}", bot->GetName());
+                    LOG_INFO("server.loading", "[OllamaBotAmigo] Invalid native strategy spec '{}' for {}", spec, bot->GetName());
                     return false;
                 }
 
-                Unit* selected = bot->GetSelectedUnit();
-                if (!selected || !selected->IsAlive() || !selected->IsHostileTo(bot))
+                BotState state;
+                if (spec.rfind("nc:", 0) == 0) state = BOT_STATE_NON_COMBAT;
+                else if (spec.rfind("co:", 0) == 0) state = BOT_STATE_COMBAT;
+                else if (spec.rfind("de:", 0) == 0) state = BOT_STATE_DEAD;
+                else
                 {
-                    Creature* target = FindNearestHostileCreature(bot, ai);
-                    if (!target)
-                    {
-                        LOG_INFO("server.loading", "[OllamaBotAmigo] Attack pull rejected (reason=no_target) for {}", bot->GetName());
-                        return false;
-                    }
-
-                    bot->SetSelection(target->GetGUID());
-                    LOG_INFO("server.loading",
-                             "[OllamaBotAmigo] Attack pull auto-selected target {} (entry={}) for {}",
-                             target->GetName(),
-                             target->GetEntry(),
-                             bot->GetName());
+                    LOG_INFO("server.loading", "[OllamaBotAmigo] Unknown native strategy state in '{}' for {}", spec, bot->GetName());
+                    return false;
                 }
+
+                std::string const change = spec.substr(3);
+                std::vector<std::string> before = ai->GetStrategies(state);
+                ai->ChangeStrategy(change, state);
+                std::vector<std::string> after = ai->GetStrategies(state);
+                changed = changed || before != after;
+
+                if (g_EnableOllamaBotAmigoDebug)
+                {
+                    LOG_INFO("server.loading",
+                             "[OllamaBotAmigo] Native strategy change for {}: state={} change='{}' before=[{}] after=[{}]",
+                             bot->GetName(), static_cast<int>(state), change, JoinStrategyNames(before), JoinStrategyNames(after));
+                }
+            }
+            return changed || !command.args.empty();
+        }
+case BotControlCommandType::PlayerbotCommand:
+
+        {
+            // Forward the remaining chat-only command to Playerbot AI.
+            if (command.args.empty())
+            {
+                return false;
             }
 
             return InjectPlayerbotCommand(bot, command.args[0], "playerbot_command");
@@ -520,7 +652,7 @@ case BotControlCommandType::PlayerbotCommand:
     return false;
 }
 
-bool HandleBotControlCommandTracked(Player* bot, const BotControlCommand& command)
+bool HandleBotControlCommandTracked(Player* bot, BotControlCommand const& command)
 {
     // Wrap command execution with stuck-memory bookkeeping.
     if (!bot)
@@ -543,6 +675,27 @@ bool HandleBotControlCommandTracked(Player* bot, const BotControlCommand& comman
         }
     }
 
+    if (ok && command.type == BotControlCommandType::PlayerbotAction && !command.args.empty())
+    {
+        std::string const& action = command.args[0];
+        if (action == "sell" || action == "buy")
+            UpdateActivityState(bot, "vendor", action == "sell" ? "native Playerbots sell" : "native Playerbots buy useful");
+        else if (action == "repair")
+            UpdateActivityState(bot, "repair", "native Playerbots repair");
+        else if (action == "trainer")
+            UpdateActivityState(bot, "trainer", "native Playerbots trainer");
+        else if (action == "hearthstone")
+            UpdateActivityState(bot, "travel", "native Playerbots hearthstone");
+        else if (action == "taxi")
+            UpdateActivityState(bot, "travel", "native Playerbots taxi");
+        else if (action == "loot")
+            UpdateActivityState(bot, "loot", "native Playerbots loot");
+        else if (action == "food" || action == "drink")
+            UpdateActivityState(bot, "recover", std::string("native Playerbots ") + action);
+        else if (action == "maintenance")
+            UpdateActivityState(bot, "maintenance", "native Playerbots maintenance");
+    }
+
     if (ok && command.type == BotControlCommandType::PlayerbotCommand && !command.args.empty())
     {
         if (command.args[0].rfind("talk", 0) == 0)
@@ -554,7 +707,7 @@ bool HandleBotControlCommandTracked(Player* bot, const BotControlCommand& comman
     return ok;
 }
 
-bool ParseBotControlCommand(Player* bot, const std::string& commandStr)
+bool ParseBotControlCommand(Player* bot, std::string const& commandStr)
 {
     // Treat any non-empty string as a Playerbot command.
     if (!bot)
@@ -577,7 +730,7 @@ bool ParseBotControlCommand(Player* bot, const std::string& commandStr)
     return false;
 }
 
-std::string FormatCommandString(const BotControlCommand& command)
+std::string FormatCommandString(BotControlCommand const& command)
 {
     // Friendly formatter for debug logs.
     std::ostringstream ss;
@@ -588,10 +741,15 @@ std::string FormatCommandString(const BotControlCommand& command)
             break;
         case BotControlCommandType::PlayerbotCommand:
             ss << "playerbot_command";
-            for (const auto& arg : command.args)
-            {
-                ss << " " << arg;
-            }
+            for (auto const& arg : command.args) ss << " " << arg;
+            break;
+        case BotControlCommandType::PlayerbotAction:
+            ss << "playerbot_action";
+            for (auto const& arg : command.args) ss << " " << arg;
+            break;
+        case BotControlCommandType::PlayerbotStrategy:
+            ss << "playerbot_strategy";
+            for (auto const& arg : command.args) ss << " " << arg;
             break;
         case BotControlCommandType::Idle:
             ss << "idle";
@@ -636,7 +794,7 @@ void UpdateActivityState(Player* bot, std::string const& activity, std::string c
 }
 
 bool EnqueueBotControlCommand(Player* bot,
-    const BotControlCommand& command,
+    BotControlCommand const& command,
     std::string const& reasoning)
 {
     // Helper used by other scripts to enqueue bot control commands.
@@ -648,6 +806,8 @@ bool EnqueueBotControlCommand(Player* bot,
     AmigoPlannerState plan;
     plan.command = command;
     plan.reasoning = reasoning;
+    plan.missionRevision = BotMissionRegistry::Instance().Get(bot->GetGUID().GetRawValue()).revision;
+    plan.lifecycleGeneration = GetBotLifecycleGeneration(bot);
 
     AmigoPlannerRegistry::Instance().Enqueue(bot, plan);
     return true;

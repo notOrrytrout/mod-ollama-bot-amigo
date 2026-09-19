@@ -1,8 +1,8 @@
 #pragma once
 
 #include "ScriptMgr.h"
-#include "Player.h"      
-#include "Define.h"       
+#include "Player.h"
+#include "Define.h"
 
 class AmigoControlControllerScript : public PlayerScript
 {

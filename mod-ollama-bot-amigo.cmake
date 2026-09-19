@@ -17,6 +17,19 @@ if(TARGET modules)
     # Professions (execution-only)
     target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Bot/BotProfession.cpp)
 
+    # Bounded LLM worker pool shared by planner/control/chat.
+    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Ai/LlmDispatch.cpp)
+    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Ai/BotMindState.cpp)
+    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Script/AmigoSocial.cpp)
+    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Script/AmigoCommands.cpp)
+    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Script/AmigoAutoLogin.cpp)
+    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Script/AmigoGroupAuthority.cpp)
+
+    # Typed semantic missions + deterministic player-needs arbitration
+    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Bot/BotMission.cpp)
+    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Bot/BotNeeds.cpp)
+    target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Bot/BotLifecycle.cpp)
+
     # Recent in-memory history (movement outcomes + goal changes/completions)
     target_sources(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Bot/BotRecentHistory.cpp)
 
@@ -26,6 +39,4 @@ if(TARGET modules)
     # Ensure module headers (including Bot/) are visible
     target_include_directories(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
     
-    # Explicitly include nlohmann-json path
-    target_include_directories(modules PRIVATE /usr/local/include /usr/local/include/nlohmann)
 endif()

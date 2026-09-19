@@ -47,7 +47,6 @@ namespace
         return v;
     }
 
-
 float Clamp(float v, float lo, float hi)
 {
     if (v < lo)
@@ -57,7 +56,7 @@ float Clamp(float v, float lo, float hi)
     return v;
 }
 
-    float AngleBetween(const G3D::Vector3& a, const G3D::Vector3& b)
+    float AngleBetween(G3D::Vector3 const& a, G3D::Vector3 const& b)
     {
         float la = a.length();
         float lb = b.length();
@@ -116,10 +115,10 @@ bool BotMovement::StartPathMove(Player* bot, WorldPosition const& dest, MoveReas
     // Make a local copy before calling getMapId().
     WorldPosition destCopy = dest;
 
-    destMapId_ = destCopy.getMapId();
-    destX_ = destCopy.getX();
-    destY_ = destCopy.getY();
-    destZ_ = destCopy.getZ();
+    destMapId_ = destCopy.GetMapId();
+    destX_ = destCopy.GetPositionX();
+    destY_ = destCopy.GetPositionY();
+    destZ_ = destCopy.GetPositionZ();
 
     if (!BuildPath(dest))
     {
@@ -188,16 +187,16 @@ bool BotMovement::BuildPath(WorldPosition const& dest)
     WorldPosition destCopy = dest;
 
     // Enforce same-map pathing only; cross-map movement is not supported here.
-    if (bot_->GetMapId() != destCopy.getMapId())
+    if (bot_->GetMapId() != destCopy.GetMapId())
         return false;
 
     PathGenerator pathGen(bot_);
     // Playerbots explicitly disables straight-line shortcuts
     pathGen.SetUseStraightPath(false);
 
-    if (!pathGen.CalculatePath(destCopy.getX(),
-                               destCopy.getY(),
-                               destCopy.getZ()))
+    if (!pathGen.CalculatePath(destCopy.GetPositionX(),
+                               destCopy.GetPositionY(),
+                               destCopy.GetPositionZ()))
         return false;
 
     path_ = pathGen.GetPath();

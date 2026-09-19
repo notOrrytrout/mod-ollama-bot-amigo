@@ -10,7 +10,7 @@ OllamaSettings GetOllamaSettings()
         g_OllamaBotControlControlPrompt
     };
 }
-const std::string& GetPrompt(LLMRole role, const OllamaSettings& settings)
+std::string const& GetPrompt(LLMRole role, OllamaSettings const& settings)
 {
     // Choose which prompt to send based on role.
     switch (role)

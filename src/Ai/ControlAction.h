@@ -28,6 +28,19 @@ struct ControlAction
         Unstay,
         TalkToQuestGiver,
         EnterAttackPull,
+        // Gather one exact nearby game object selected by entry ID.
+        GatherTarget,
+        // Native Playerbots service and recovery capabilities.
+        VendorSell,
+        VendorBuyUseful,
+        Repair,
+        Trainer,
+        Hearthstone,
+        Taxi,
+        Loot,
+        Food,
+        Drink,
+        Maintenance,
         // Profession: fish from current spot (no movement).
         Fish,
         // Profession: generic request (e.g. "mining" / "fish" / "craft").
@@ -48,6 +61,7 @@ struct ControlAction
     std::string navCandidateId;
     uint32 questId = 0;
     uint32 npcEntryId = 0;
+    uint32 gameObjectEntryId = 0;
     std::string professionSkill;
     std::string professionIntent;
 };
@@ -57,6 +71,13 @@ struct ControlActionState
     // Action plus a human-readable explanation from the planner.
     ControlAction action;
     std::string reasoning;
+    // Mission generation captured when the async control request started.
+    // The main-thread controller rejects the action if this is stale.
+    uint64 missionRevision = 0;
+    // Lifecycle execution generation captured with the same request. A needs or
+    // maintenance lane transition invalidates old model work without changing
+    // the durable mission.
+    uint64 lifecycleGeneration = 0;
 };
 
 class ControlActionRegistry

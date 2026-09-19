@@ -5,15 +5,20 @@
 #include "Ai/OllamaRuntime.h"
 #include "Bot/BotMovement.h"
 #include "Bot/BotNavState.h"
+#include "Bot/BotMission.h"
+#include "Bot/BotNeeds.h"
+#include "Bot/BotLifecycle.h"
 #include "Bot/BotRecentHistory.h"
 #include "Util/WorldChecks.h"
 #include "ObjectMgr.h"
 #include "GameObject.h"
+#include "LootObjectStack.h"
 #include "ObjectAccessor.h"
 #include "Bot/BotTravel.h"
 #include "Bot/BotProfession.h"
 #include "Log.h"
 #include "Util/PlayerbotsCompat.h"
+#include "Event.h"
 #include "SharedDefines.h"
 #include "QuestDef.h"
 #include "Timer.h"
@@ -68,7 +73,7 @@ namespace
         return snapshot;
     }
 
-    const char* CapabilityName(ControlAction::Capability capability)
+    char const* CapabilityName(ControlAction::Capability capability)
     {
         // Human-readable labels for logging.
         switch (capability)
@@ -77,6 +82,18 @@ namespace
             case ControlAction::Capability::MoveHop:            return "move_hop";
             case ControlAction::Capability::MoveHopNpc:         return "move_hop_npc";
             case ControlAction::Capability::EnterGrind:         return "enter_grind";
+            case ControlAction::Capability::EnterAttackPull:    return "attack_target";
+            case ControlAction::Capability::GatherTarget:       return "gather_target";
+            case ControlAction::Capability::VendorSell:        return "vendor_sell";
+            case ControlAction::Capability::VendorBuyUseful:   return "vendor_buy_useful";
+            case ControlAction::Capability::Repair:            return "repair";
+            case ControlAction::Capability::Trainer:           return "trainer";
+            case ControlAction::Capability::Hearthstone:       return "hearthstone";
+            case ControlAction::Capability::Taxi:              return "taxi";
+            case ControlAction::Capability::Loot:              return "loot";
+            case ControlAction::Capability::Food:              return "food";
+            case ControlAction::Capability::Drink:             return "drink";
+            case ControlAction::Capability::Maintenance:       return "maintenance";
             case ControlAction::Capability::StopGrind:          return "stop_grind";
             case ControlAction::Capability::Stay:               return "stay";
             case ControlAction::Capability::Unstay:             return "unstay";
@@ -262,6 +279,40 @@ namespace
             }
         }
 
+        return best;
+    }
+
+    GameObject* FindNearestGameObjectByEntryId(Player* bot, PlayerbotAI* ai, uint32 entryId)
+    {
+        if (!bot || !ai || entryId == 0)
+        {
+            return nullptr;
+        }
+
+        AiObjectContext* context = ai->GetAiObjectContext();
+        if (!context)
+        {
+            return nullptr;
+        }
+
+        GameObject* best = nullptr;
+        float bestDistance = std::numeric_limits<float>::max();
+        GuidVector objects = context->GetValue<GuidVector>("nearest game objects")->Get();
+        for (ObjectGuid const& objectGuid : objects)
+        {
+            GameObject* gameObject = ai->GetGameObject(objectGuid);
+            if (!gameObject || gameObject->GetEntry() != entryId || !gameObject->isSpawned())
+            {
+                continue;
+            }
+
+            float distance = bot->GetDistance(gameObject);
+            if (!best || distance < bestDistance)
+            {
+                best = gameObject;
+                bestDistance = distance;
+            }
+        }
         return best;
     }
 
@@ -452,6 +503,40 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         return;
     }
 
+    if (!BotMissionRegistry::Instance().RevisionMatches(guid, actionState.missionRevision))
+    {
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored queued control action for {} because mission revision {} is stale",
+                 player->GetName(), actionState.missionRevision);
+        return;
+    }
+
+    if (GetBotLifecycleGeneration(guid) != actionState.lifecycleGeneration)
+    {
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored queued control action for {} because lifecycle generation {} is stale",
+                 player->GetName(), actionState.lifecycleGeneration);
+        return;
+    }
+
+    // Lifecycle ownership is separate from mission revision. An LLM action may
+    // have been requested before a deterministic recovery/maintenance detour
+    // began, so re-check the execution lane on the main thread before applying it.
+    BotNeedAssessment queuedNeed = AssessBotNeeds(player);
+    BotLifecycleAssessment queuedLifecycle = AssessBotLifecycle(player, ai, queuedNeed);
+    if (queuedLifecycle.lane == BotLifecycleLane::Combat ||
+        queuedLifecycle.lane == BotLifecycleLane::Needs ||
+        queuedLifecycle.lane == BotLifecycleLane::Loot ||
+        HasActiveBotLifecycleOverlay(player) ||
+        (queuedLifecycle.lane == BotLifecycleLane::Maintenance && queuedLifecycle.urgent))
+    {
+        LOG_INFO("server.loading",
+                 "[OllamaBotAmigo] Ignored queued control action for {} because lifecycle lane '{}' owns execution (maintenance='{}', reason='{}')",
+                 player->GetName(),
+                 queuedLifecycle.LaneName(),
+                 queuedLifecycle.MaintenanceName(),
+                 queuedLifecycle.reason);
+        return;
+    }
+
     BotSnapshot snapshot = BuildBotSnapshot(player);
 
     if (snapshot.isMoving &&
@@ -466,6 +551,23 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
     if (snapshot.inCombat)
     {
         LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored control action during combat for {}", player->GetName());
+        return;
+    }
+
+    BotMaintenanceKind serviceKind = BotMaintenanceKind::None;
+    switch (actionState.action.capability)
+    {
+        case ControlAction::Capability::VendorSell: serviceKind = BotMaintenanceKind::BagSpace; break;
+        case ControlAction::Capability::Repair: serviceKind = BotMaintenanceKind::Repair; break;
+        case ControlAction::Capability::Trainer: serviceKind = BotMaintenanceKind::Training; break;
+        case ControlAction::Capability::VendorBuyUseful: serviceKind = BotMaintenanceKind::Supplies; break;
+        default: break;
+    }
+    if (serviceKind != BotMaintenanceKind::None)
+    {
+        bool accepted = RequestBotLifecycleService(player, serviceKind);
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Service request for {}: {} accepted={}",
+                 player->GetName(), CapabilityName(actionState.action.capability), accepted);
         return;
     }
 
@@ -772,6 +874,107 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         travelKey << "move_hop:candidate:" << actionState.action.navEpoch << ":" << actionState.action.navCandidateId;
         AmigoTravelTarget targetSpec{travelKey.str(), dest, 2.5f, timeoutMs};
         travel->Begin(targetSpec, nowMs);
+        return;
+    }
+
+    if (actionState.action.capability == ControlAction::Capability::EnterAttackPull)
+    {
+        // Recheck live quest state: loot may complete a quest after the
+        // asynchronous control snapshot was taken.
+        for (auto const& quest : player->getQuestStatusMap())
+        {
+            if (player->GetQuestStatus(quest.first) == QUEST_STATUS_COMPLETE)
+            {
+                LOG_INFO("server.loading", "[OllamaBotAmigo] Attack deferred for {}: quest turn-in pending",
+                         player->GetName());
+                return;
+            }
+        }
+        if (actionState.action.npcEntryId == 0)
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting targeted attack: missing entry_id for {}", player->GetName());
+            return;
+        }
+
+        BotMissionState missionState = BotMissionRegistry::Instance().Get(guid);
+        if (missionState.mission.kind != BotMissionKind::Grind || missionState.mission.target.empty())
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting targeted attack outside a named grind mission for {}", player->GetName());
+            return;
+        }
+
+        Creature* target = FindNearestNpcByEntryId(player, ai, actionState.action.npcEntryId);
+        if (!target || !target->IsAlive() || !player->IsValidAttackTarget(target) ||
+            !missionState.mission.MatchesTargetName(target->GetName()))
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting targeted attack for {}: entry_id={} is not a live attackable exact mission target",
+                     player->GetName(), actionState.action.npcEntryId);
+            return;
+        }
+
+        player->SetSelection(target->GetGUID());
+        BotControlCommand command;
+        command.type = BotControlCommandType::PlayerbotAction;
+        char const* attackAction = ai->IsTank(player) ? "pull my target" : "attack selected target";
+        command.args = { attackAction };
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Targeted grind attack accepted for {}: {} (entry={}, action={})",
+                 player->GetName(), target->GetName(), target->GetEntry(), attackAction);
+        EnqueueBotControlCommand(player, command, actionState.reasoning);
+        return;
+    }
+
+    if (actionState.action.capability == ControlAction::Capability::GatherTarget)
+    {
+        if (actionState.action.gameObjectEntryId == 0)
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting targeted gather: missing entry_id for {}", player->GetName());
+            return;
+        }
+
+        BotMissionState missionState = BotMissionRegistry::Instance().Get(guid);
+        if (missionState.mission.kind != BotMissionKind::Gather || missionState.mission.target.empty())
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting targeted gather outside a named gather mission for {}", player->GetName());
+            return;
+        }
+
+        GameObject* target = FindNearestGameObjectByEntryId(player, ai, actionState.action.gameObjectEntryId);
+        if (!target || !missionState.mission.MatchesTargetName(target->GetName()))
+        {
+            LOG_INFO("server.loading",
+                     "[OllamaBotAmigo] Rejecting targeted gather for {}: entry_id={} is not an exact nearby mission target",
+                     player->GetName(), actionState.action.gameObjectEntryId);
+            return;
+        }
+
+        LootObject loot(player, target->GetGUID());
+        if (loot.IsEmpty() || loot.skillId == SKILL_NONE || !loot.IsLootPossible(player))
+        {
+            LOG_INFO("server.loading",
+                     "[OllamaBotAmigo] Rejecting targeted gather for {}: {} (entry={}) is not gatherable with current Playerbots loot rules",
+                     player->GetName(), target->GetName(), target->GetEntry());
+            return;
+        }
+
+        if (!ai->HasStrategy("loot", BOT_STATE_NON_COMBAT))
+        {
+            ai->ChangeStrategy("+loot", BOT_STATE_NON_COMBAT);
+        }
+
+        const bool added = ai->DoSpecificAction(
+            "add loot", Event("ollama_bot_amigo_gather", target->GetGUID(), player), true);
+        if (!added)
+        {
+            LOG_INFO("server.loading",
+                     "[OllamaBotAmigo] Playerbots refused targeted gather object for {}: {} (entry={})",
+                     player->GetName(), target->GetName(), target->GetEntry());
+            return;
+        }
+
+        UpdateActivityState(player, "gather", std::string("exact target: ") + target->GetName());
+        LOG_INFO("server.loading",
+                 "[OllamaBotAmigo] Targeted gather queued through Playerbots loot stack for {}: {} (entry={}, skill={}, required={})",
+                 player->GetName(), target->GetName(), target->GetEntry(), loot.skillId, loot.reqSkillValue);
         return;
     }
 

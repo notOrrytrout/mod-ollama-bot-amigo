@@ -17,6 +17,7 @@ public:
     void OnUpdate(uint32 diff) override;
 };
 
-
 // Escape braces for fmt-style logging.
-std::string EscapeBracesForFmt(const std::string& input);
+
+// Exact compact STATE_JSON most recently supplied to the control model.
+std::string GetAmigoLatestControlStateJson();

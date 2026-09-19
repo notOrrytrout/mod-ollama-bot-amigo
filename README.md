@@ -244,3 +244,64 @@ Thanks to Ollama Buddy Bot for their code.
   - Developed by Dustin Hendrickson.
 
 Also brought to you in part by codex and ollama.
+
+## Ollama and oMLX providers
+
+Amigo can use either the native Ollama generate API or oMLX's OpenAI-compatible chat API. The gameplay/planner/chat layers use the same bounded dispatcher for both providers.
+
+Ollama:
+
+```ini
+OllamaBotControl.Llm.Provider = ollama
+OllamaBotControl.Url = http://localhost:11434/api/generate
+```
+
+oMLX:
+
+```ini
+OllamaBotControl.Llm.Provider = omlx
+OllamaBotControl.Url = http://localhost:8000/v1/chat/completions
+# Optional for a protected remote endpoint:
+OllamaBotControl.Llm.ApiKey =
+```
+
+For oMLX, model names must match a model visible to the oMLX OpenAI-compatible API. Planner/control think policy is mapped to oMLX `enable_thinking`; if the selected model/template rejects it, Amigo retries without thinking and suppresses it for the session.
+
+
+### Group authority
+
+By default, Amigo treats party members (including the party leader) as peers rather than owners.
+`OllamaBotControl.Group.Authority = peer` prevents Playerbots from silently promoting a real group member to permanent master/follow authority. Explicit party messages such as `follow me` or `assist me` create a temporary, time-bounded directive controlled by Amigo. `OllamaBotControl.Group.DirectiveTtlMs` controls its duration. Set authority to `playerbots` only to restore legacy Playerbots master behavior.
+
+
+## Runtime mock inspection / injection
+
+For deterministic control tests, the latest exact control snapshot can be inspected without guessing IDs:
+
+```text
+amigo state
+```
+
+This prints the compact `STATE_JSON` most recently supplied to the control model.
+
+A mock tool can then be injected at runtime without editing/reloading the config:
+
+```text
+amigo mock request_attack_target entry_id=705
+```
+
+Other examples:
+
+```text
+amigo mock request_turn_left_90 {}
+amigo mock request_gather_target entry_id=1731
+amigo mock request_move_hop nav_epoch=7,candidate_id=nav_0
+```
+
+The injected tool call still passes through the normal parser, snapshot validation, mission/lifecycle gating, controller, and Playerbots execution.
+
+Clear the runtime override with:
+
+```text
+amigo mock clear
+```

@@ -25,4 +25,4 @@ struct OllamaSettings
 // Aggregate prompt settings from config.
 OllamaSettings GetOllamaSettings();
 // Select the prompt for a given LLM role.
-const std::string& GetPrompt(LLMRole role, const OllamaSettings& settings);
+std::string const& GetPrompt(LLMRole role, OllamaSettings const& settings);
