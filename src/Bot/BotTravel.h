@@ -68,7 +68,7 @@ class BotTravel
 {
 public:
     // Shared movement entry point. This owns the movement/travel transaction.
-    bool Start(Player* bot, BotMovement* movement, AmigoTravelTarget const& target,
+    bool Start(Player* bot, PlayerbotAI* ai, BotMovement* movement, AmigoTravelTarget const& target,
                MoveReason reason, uint32_t nowMs);
     void Begin(AmigoTravelTarget const& target, uint32_t nowMs);
     void Abort(uint32_t nowMs, BotMovement* movement = nullptr);

@@ -19,6 +19,15 @@ void Check(bool condition, char const* message)
 int main()
 {
     BotTaskProgress route;
+    BotTaskProgress travelDetour;
+    travelDetour.Reset(0, 0); // No spline has been issued yet.
+    travelDetour.Observe(60, 1000); // Native route starts.
+    for (uint32_t now = 2000; now <= 20000; now += 1000)
+    {
+        travelDetour.Observe(61.0f - now / 1000.0f, now);
+        Check(!travelDetour.Stalled(now), "native route progress must survive a long outward detour");
+    }
+    Check(travelDetour.Stalled(28000), "a stopped native route must still time out");
     Check(AmigoPointInterrupted(true, false, false, false, false, false), "moving replacement must interrupt immediately");
     Check(AmigoPointInterrupted(true, false, false, true, true, true), "replacement at old endpoint must still interrupt");
     Check(!AmigoPointInterrupted(true, false, true, true, true, true), "normal point completion must not interrupt");

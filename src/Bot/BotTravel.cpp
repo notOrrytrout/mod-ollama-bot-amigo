@@ -13,14 +13,14 @@
 std::mutex BotTravelRegistry::mutex_;
 std::unordered_map<uint64_t, BotTravel*> BotTravelRegistry::travelByGuid_;
 
-bool BotTravel::Start(Player* bot, BotMovement* movement, AmigoTravelTarget const& target,
+bool BotTravel::Start(Player* bot, PlayerbotAI* ai, BotMovement* movement, AmigoTravelTarget const& target,
                       MoveReason reason, uint32_t nowMs)
 {
-    if (!bot || !movement || active_)
+    if (!bot || !ai || !movement || active_)
         return false;
     if (!bot->IsAlive() || bot->IsInCombat())
         return false;
-    if (!movement->StartPathMove(bot, target.dest, reason))
+    if (!movement->StartPathMove(bot, ai, target.dest, reason))
         return false;
     Begin(target, nowMs);
     if (!target_->missionRevision)
@@ -166,7 +166,7 @@ void BotTravel::Update(Player* bot, uint32_t nowMs, BotMovement* movement)
                 return;
             }
             movement->Abort(MoveReason::Travel);
-            movement->StartPathMove(bot, target_->dest, MoveReason::Travel);
+            movement->StartPathMove(bot, movement->GetPlayerbotAI(), target_->dest, MoveReason::Travel);
             progress_.Retry(movement->RemainingRoute(), nowMs);
         }
     }

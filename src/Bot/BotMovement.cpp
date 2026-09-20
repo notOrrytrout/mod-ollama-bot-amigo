@@ -6,6 +6,8 @@
 #include "MoveSpline.h"
 #include "PathGenerator.h"
 #include "Player.h"
+#include "PlayerbotAI.h"
+#include "LastMovementValue.h"
 #include "Timer.h"
 #include "Util/WorldPositionCompat.h"
 
@@ -44,9 +46,9 @@ namespace
     }
 } // namespace
 
-bool BotMovement::StartPathMove(Player* bot, WorldPosition const& dest, MoveReason reason)
+bool BotMovement::StartPathMove(Player* bot, PlayerbotAI* ai, WorldPosition const& dest, MoveReason reason)
 {
-    if (!bot)
+    if (!bot || !ai)
         return false;
 
     // If already active, allow higher-priority moves to interrupt lower-priority.
@@ -64,6 +66,7 @@ bool BotMovement::StartPathMove(Player* bot, WorldPosition const& dest, MoveReas
     }
 
     bot_ = bot;
+    ai_ = ai;
     reason_ = reason;
     interrupted_ = false;
 
@@ -79,6 +82,7 @@ bool BotMovement::StartPathMove(Player* bot, WorldPosition const& dest, MoveReas
     if (!BuildPath(dest))
     {
         bot_ = nullptr;
+        ai_ = nullptr;
         return false;
     }
 
@@ -154,8 +158,8 @@ void BotMovement::Abort(MoveReason /*reason*/)
     if (AmigoOwnsPoint(issuedPoint_, splineId_, bot_->movespline->GetId(),
         bot_->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE))
     {
-        bot_->StopMoving();
-        bot_->GetMotionMaster()->MovementExpired();
+        if (ai_)
+            ai_->StopMovement();
     }
     issuedPoint_ = false;
     active_ = false;
@@ -202,33 +206,31 @@ bool BotMovement::BuildPath(WorldPosition const& dest)
 
 float BotMovement::RemainingRoute() const
 {
-    if (!bot_ || path_.empty())
+    if (!bot_)
         return 0.0f;
-    G3D::Vector3 previous(bot_->GetPositionX(), bot_->GetPositionY(), bot_->GetPositionZ());
-    float remaining = 0.0f;
-    for (auto const& point : path_)
-    {
-        remaining += (point - previous).length();
-        previous = point;
-    }
-    return remaining;
+
+    // The native spline advances even when a route bends away from the goal.
+    // Report remaining route time in seconds, not straight-line distance.
+    if (issuedPoint_ && bot_->GetMotionMaster()->top() == issuedGenerator_)
+        return std::max(0, bot_->movespline->Duration() - bot_->movespline->timePassed()) / 1000.0f;
+    return 0.0f;
 }
 
 void BotMovement::Advance()
 {
-    G3D::Vector3 current(bot_->GetPositionX(), bot_->GetPositionY(), bot_->GetPositionZ());
-    while (!path_.empty() && (path_.front() - current).length() <= 0.5f)
-        path_.erase(path_.begin());
     if (path_.empty())
         return;
-    // Keep each pathfinder corner until reached. Issuing a point is not progress.
-    auto const& target = path_.front();
-    bot_->GetMotionMaster()->MovePoint(0, target.x, target.y, target.z);
+    // Playerbots executes the destination. The validation path is not used
+    // for progress; progress comes from the active native spline.
+    if (!ai_ || !ai_->MoveToPosition(destMapId_, destX_, destY_, destZ_,
+        reason_ == MoveReason::Combat ? MovementPriority::MOVEMENT_COMBAT : MovementPriority::MOVEMENT_NORMAL))
+        return;
+
     splineId_ = bot_->movespline->GetId();
     issuedGenerator_ = bot_->GetMotionMaster()->top();
-    issuedX_ = target.x;
-    issuedY_ = target.y;
-    issuedZ_ = target.z;
+    issuedX_ = destX_;
+    issuedY_ = destY_;
+    issuedZ_ = destZ_;
     issuedPoint_ = true;
 }
 
@@ -249,16 +251,9 @@ bool BotMovement::ReachedDestination() const
     if (!bot_)
         return true;
 
-    // If we've consumed the path, require the correct floor as well as the
-    // horizontal arrival radius. A wrong-floor endpoint must not complete.
-    if (path_.empty())
-    {
-        float d2 = Dist2D(bot_->GetPositionX(), bot_->GetPositionY(), destX_, destY_);
-        float dz = std::fabs(bot_->GetPositionZ() - destZ_);
-        return d2 <= kReachedEpsilon && dz <= 1.5f;
-    }
-
-    return false;
+    float d2 = Dist2D(bot_->GetPositionX(), bot_->GetPositionY(), destX_, destY_);
+    float dz = std::fabs(bot_->GetPositionZ() - destZ_);
+    return d2 <= kReachedEpsilon && dz <= 1.5f;
 }
 
 void BotMovementRegistry::Register(uint64 guid, BotMovement* movement)

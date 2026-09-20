@@ -4555,7 +4555,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     replacement.purpose = AmigoTravelPurpose::LiveTarget;
                     replacement.completion = AmigoCompletionCondition::LiveTarget;
                     state.travel.Abort(nowMs, &state.movement);
-                    state.travel.Start(bot, &state.movement, replacement, MoveReason::Travel, nowMs);
+                    state.travel.Start(bot, ai, &state.movement, replacement, MoveReason::Travel, nowMs);
                     break;
                 }
             }

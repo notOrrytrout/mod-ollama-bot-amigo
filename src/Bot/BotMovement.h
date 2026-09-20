@@ -8,6 +8,7 @@
 #include <vector>
 
 class Player;
+class PlayerbotAI;
 class MovementGenerator;
 class WorldPosition;
 
@@ -22,13 +23,13 @@ enum class MoveReason
 // Stateful, tick-driven path movement wrapper.
 //
 // HARD RULES:
-// - Only this unit may call MotionMaster/MovePoint for the bot.
+// - Playerbots owns movement execution and cancellation.
+// - This unit validates the destination and tracks the travel transaction.
 // - Uses TrinityCore PathGenerator; no manual Z interpolation.
-// - Long/multi-floor movement must be path-based.
 class BotMovement
 {
 public:
-    bool StartPathMove(Player* bot, WorldPosition const& dest, MoveReason reason);
+    bool StartPathMove(Player* bot, PlayerbotAI* ai, WorldPosition const& dest, MoveReason reason);
 
     // Called every server tick.
     void Update(uint32 diff);
@@ -39,6 +40,7 @@ public:
     float RemainingRoute() const;
     bool IsMoving() const { return active_; }
     bool ConsumeInterruption();
+    PlayerbotAI* GetPlayerbotAI() const { return ai_; }
 
 private:
     bool BuildPath(WorldPosition const& dest);
@@ -48,6 +50,7 @@ private:
 
 private:
     Player* bot_ = nullptr;
+    PlayerbotAI* ai_ = nullptr;
     Movement::PointsArray path_;
     MoveReason reason_ = MoveReason::Travel;
 

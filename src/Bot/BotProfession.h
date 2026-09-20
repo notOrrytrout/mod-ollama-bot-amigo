@@ -40,6 +40,8 @@ private:
     uint32_t startMs_ = 0;
     uint32_t lastStepMs_ = 0;
     uint32_t lastChangeMs_ = 0;
+    bool bobberStrategySeen_ = false;
+    uint64_t fishingCompletionBaseline_ = 0;
 };
 
 class BotProfessionRegistry

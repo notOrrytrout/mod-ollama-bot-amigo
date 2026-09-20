@@ -718,7 +718,7 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         targetSpec.targetGuid = npc->GetGUID().GetRawValue();
         if (searchTakeover)
             travel->Abort(nowMs, movement);
-        if (!travel->Start(player, movement, targetSpec, MoveReason::Travel, nowMs))
+        if (!travel->Start(player, ai, movement, targetSpec, MoveReason::Travel, nowMs))
         {
             LOG_INFO("server.loading", "[OllamaBotAmigo] move_hop_npc path start failed for {} (entry_id={})", player->GetName(), actionState.action.npcEntryId);
             recordMoveHopNpc(false, "engine:start_path_failed", reachable, hasLOS);
@@ -915,7 +915,7 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
                  << std::llround(dest.GetPositionZ() * 2.0f);
         targetSpec.retryKey = retryKey.str();
         targetSpec.purpose = AmigoTravelPurpose::Search;
-        if (!travel->Start(player, movement, targetSpec, MoveReason::Travel, nowMs))
+        if (!travel->Start(player, ai, movement, targetSpec, MoveReason::Travel, nowMs))
         {
             LOG_INFO("server.loading", "[OllamaBotAmigo] move_hop path start failed for {}", player->GetName());
             recordMoveHop(false, "engine:start_path_failed",

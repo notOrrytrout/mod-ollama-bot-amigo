@@ -6,3 +6,6 @@ add_executable(amigo_control_tests ControlDecisionTests.cpp)
 target_compile_features(amigo_control_tests PRIVATE cxx_std_20)
 target_include_directories(amigo_control_tests PRIVATE ../src ${AMIGO_JSON_INCLUDE})
 add_test(NAME amigo_control_decisions COMMAND amigo_control_tests)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME amigo_integration_boundaries COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/IntegrationBoundaryTests.py)

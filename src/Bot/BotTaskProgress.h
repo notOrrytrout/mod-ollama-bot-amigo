@@ -28,6 +28,7 @@ public:
     void Reset(float remaining, uint32_t now) { best_ = remaining; changed_ = now; attempts_ = 0; }
     void Observe(float remaining, uint32_t now)
     {
+        if (best_ == 0 && remaining > 0) { best_ = remaining; changed_ = now; }
         if (remaining + 0.5f < best_) { best_ = remaining; changed_ = now; }
     }
     bool Stalled(uint32_t now) const { return now - changed_ >= 8000; }

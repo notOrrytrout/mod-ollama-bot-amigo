@@ -518,6 +518,13 @@ bool HandleBotControlCommand(Player* bot, BotControlCommand const& command)
     }
 
     uint64 guid = GetBotGuid(bot);
+    PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!ai)
+    {
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Move hop rejected (reason=no_playerbot_ai) for {}", bot->GetName());
+        return false;
+    }
+
     BotMovement* movement = BotMovementRegistry::Get(guid);
     BotTravel* travel = BotTravelRegistry::Get(guid);
     if (!movement)
@@ -552,7 +559,7 @@ bool HandleBotControlCommand(Player* bot, BotControlCommand const& command)
         key = "api:" + key;
     AmigoTravelTarget targetSpec{key, dest, 2.5f, timeoutMs};
     targetSpec.purpose = AmigoTravelPurpose::Manual;
-    if (!travel->Start(bot, movement, targetSpec, MoveReason::Travel, nowMs))
+    if (!travel->Start(bot, ai, movement, targetSpec, MoveReason::Travel, nowMs))
     {
         LOG_INFO("server.loading", "[OllamaBotAmigo] Move hop path start failed for {}", bot->GetName());
         return false;

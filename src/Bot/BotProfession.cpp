@@ -9,11 +9,11 @@ namespace
 {
     // Playerbots action names (see ActionContext.h).
     constexpr char const* kActionGoFishing = "go fishing";
-    constexpr char const* kActionUseBobber = "use fishing bobber";
     constexpr char const* kActionRemoveBobber = "remove bobber strategy";
 
-    // Tick cadence for bobber checks.
-    constexpr uint32_t kBobberPollIntervalMs = 1000;
+    // Retry the cast/equip action after Playerbots has had time to update the
+    // bot. Once the bobber strategy exists, Playerbots owns the bobber loop.
+    constexpr uint32_t kFishingActionIntervalMs = 1000;
 
     // Safety timeout for a fishing cycle (cast + wait for bite).
     // In practice, fishing bites are usually quicker; this prevents hanging.
@@ -50,7 +50,7 @@ bool BotProfession::StartFishing(Player* bot, PlayerbotAI* ai, uint32_t nowMs)
     if (active_ || !bot || !ai)
         return false;
 
-    if (ShouldAbort(bot))
+    if (!ai || ShouldAbort(bot))
         return false;
 
     // Prime Playerbots' fishing spot value so the "go fishing" action is "useful".
@@ -63,7 +63,9 @@ bool BotProfession::StartFishing(Player* bot, PlayerbotAI* ai, uint32_t nowMs)
         }
     }
 
-    // Start the fishing cast. This uses Playerbots FishingAction (no MotionMaster).
+    fishingCompletionBaseline_ = ai->GetFishingCompletions();
+    // Start fishing through Playerbots. Playerbots owns pole equipment, the
+    // cast, and the bobber strategy.
     if (!ai->DoSpecificAction(kActionGoFishing, Event(), true))
     {
         // Make sure any partial strategies are cleaned up.
@@ -77,6 +79,7 @@ bool BotProfession::StartFishing(Player* bot, PlayerbotAI* ai, uint32_t nowMs)
     startMs_ = nowMs;
     lastStepMs_ = nowMs;
     lastChangeMs_ = nowMs;
+    bobberStrategySeen_ = ai->HasStrategy("use bobber", BOT_STATE_NON_COMBAT);
 
     LOG_INFO("server.loading", "[OllamaBotAmigo] Profession started: fishing");
     return true;
@@ -87,7 +90,7 @@ void BotProfession::Update(Player* bot, PlayerbotAI* ai, uint32_t nowMs)
     if (!active_)
         return;
 
-    if (ShouldAbort(bot))
+    if (!ai || ShouldAbort(bot))
     {
         Abort(bot, ai, nowMs);
         return;
@@ -95,6 +98,15 @@ void BotProfession::Update(Player* bot, PlayerbotAI* ai, uint32_t nowMs)
 
     if (activity_ != ProfessionActivity::Fishing)
         return;
+
+    if (ai->GetFishingCompletions() != fishingCompletionBaseline_)
+    {
+        active_ = false;
+        activity_ = ProfessionActivity::None;
+        lastResult_ = ProfessionResult::Succeeded;
+        lastChangeMs_ = nowMs;
+        return;
+    }
 
     if (nowMs - startMs_ > kFishingTimeoutMs)
     {
@@ -105,19 +117,35 @@ void BotProfession::Update(Player* bot, PlayerbotAI* ai, uint32_t nowMs)
         return;
     }
 
-    if (nowMs - lastStepMs_ < kBobberPollIntervalMs)
+    bool bobberStrategyActive = ai && ai->HasStrategy("use bobber", BOT_STATE_NON_COMBAT);
+    if (bobberStrategyActive)
+    {
+        bobberStrategySeen_ = true;
+        return;
+    }
+
+    // Strategy removal alone can be random cancellation, not completion.
+    if (bobberStrategySeen_)
+    {
+        active_ = false;
+        activity_ = ProfessionActivity::None;
+        lastResult_ = ProfessionResult::Aborted;
+        lastChangeMs_ = nowMs;
+        return;
+    }
+
+    if (nowMs - lastStepMs_ < kFishingActionIntervalMs)
         return;
 
     lastStepMs_ = nowMs;
 
-    // Attempt to use the bobber when it becomes ready.
-    // Playerbots internally throttles checks based on bobber respawn time.
-    if (ai && ai->DoSpecificAction(kActionUseBobber, Event(), true))
+    // Equipment can consume the first Playerbots action without casting. Give
+    // Playerbots another chance to run its normal fishing action. The bobber
+    // itself remains entirely under Playerbots control.
+    if (ai)
     {
-        ClearBobberStrategy(ai);
-        active_ = false;
-        lastResult_ = ProfessionResult::Succeeded;
-        lastChangeMs_ = nowMs;
+        ai->DoSpecificAction(kActionGoFishing, Event(), true);
+        bobberStrategySeen_ = ai->HasStrategy("use bobber", BOT_STATE_NON_COMBAT);
     }
 }
 
@@ -131,6 +159,7 @@ void BotProfession::Abort(Player*, PlayerbotAI* ai, uint32_t nowMs)
     activity_ = ProfessionActivity::None;
     lastResult_ = ProfessionResult::Aborted;
     lastChangeMs_ = nowMs;
+    bobberStrategySeen_ = false;
 }
 
 std::mutex BotProfessionRegistry::mutex_;

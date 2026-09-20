@@ -39,12 +39,8 @@ namespace
         if (!bot || !ai || !bot->GetGroup())
             return;
 
-        // Playerbots automatically chooses a real group member as master and
-        // enables +follow. In Amigo peer mode, self-master is a containment
-        // sentinel: it prevents Playerbots from re-electing a human as owner.
-        // It is not exposed as Amigo authority and is cleared when ungrouped.
-        if (ai->GetMaster() != bot)
-            ai->SetMaster(bot);
+        ai->SetExternalAuthority(true);
+        ai->SetMaster(nullptr);
 
         if (ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
             ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
@@ -66,9 +62,10 @@ void AmigoGroupAuthorityScript::ClearDirective(bool normalizePeer, char const* r
             if (ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
                 ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
 
-            if ((bot->GetSession() && !bot->GetSession()->IsBot()) || (normalizePeer && bot->GetGroup()))
+            ai->SetExternalAuthority(normalizePeer);
+            if (bot->GetSession() && !bot->GetSession()->IsBot())
                 ai->SetMaster(bot);
-            else if (ai->GetMaster() == bot || (activeTargetGuid_ && ai->GetMaster() && ai->GetMaster()->GetGUID().GetRawValue() == activeTargetGuid_))
+            else
                 ai->SetMaster(nullptr);
         }
         AmigoMindClearPeerDirective(bot->GetGUID().GetRawValue());
@@ -113,6 +110,7 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
         return;
 
     const uint64 botGuid = bot->GetGUID().GetRawValue();
+    ai->SetExternalAuthority(g_OllamaBotRuntime.enable_control && g_AmigoGroupAuthority != "playerbots");
 
     // Playerbots uses self-master identity to send object updates to a real
     // client. Peer ownership changes must never remove that identity.
@@ -154,9 +152,8 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
     if (!bot->GetGroup())
     {
         if (activeBotGuid_)
-            ClearDirective(false, "left_group");
-        else if (ai->GetMaster() == bot)
-            ai->SetMaster(nullptr);
+            ClearDirective(true, "left_group");
+        ai->SetMaster(nullptr);
         AmigoMindClearPeerDirective(botGuid);
         return;
     }
