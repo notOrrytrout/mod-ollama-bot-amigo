@@ -1,4 +1,6 @@
 #include "Ai/OllamaClient.h"
+#include "Ai/ControlDecision.h"
+#include "Ai/ControlContract.h"
 #include "Script/OllamaBotConfig.h"
 #include "Log.h"
 
@@ -25,6 +27,9 @@ namespace
     std::string gApiKey;
     uint32_t gThinkLatencyGuardMs = 8000;
     bool gMockEnable = false;
+    bool gMockControlEnable = false;
+    bool gMockPlannerEnable = false;
+    bool gMockChatEnable = false;
     uint32_t gMockLatencyMs = 25;
     uint32_t gMockFailEvery = 0;
     std::string gMockControlTool = "auto";
@@ -43,6 +48,9 @@ namespace
         std::string apiKey;
         uint32_t thinkLatencyGuardMs = 0;
         bool mockEnable = false;
+        bool mockControlEnable = false;
+        bool mockPlannerEnable = false;
+        bool mockChatEnable = false;
         uint32_t mockLatencyMs = 0;
         uint32_t mockFailEvery = 0;
         std::string mockControlTool;
@@ -62,6 +70,9 @@ namespace
             gApiKey,
             gThinkLatencyGuardMs,
             gMockEnable,
+            gMockControlEnable,
+            gMockPlannerEnable,
+            gMockChatEnable,
             gMockLatencyMs,
             gMockFailEvery,
             gMockControlTool,
@@ -283,150 +294,39 @@ namespace
         return fallback;
     }
 
-    std::string MockQuestingControlTool(std::string const& prompt, nlohmann::json& arguments)
+    std::string MockQuestingControlTool(std::string const& prompt, nlohmann::json& arguments, bool& noOp)
     {
         arguments = nlohmann::json::object();
+        noOp = true;
         nlohmann::json state;
-        if (ExtractMockControlState(prompt, state))
+        if (!ExtractMockControlState(prompt, state))
+            return {};
+        auto selection = SelectControlDecision(state);
+        if (selection.empty())
+            return {};
+        arguments = selection.at("arguments");
+        noOp = false;
+        return selection.at("name").get<std::string>();
+    }
+
+    bool ShouldMockRequest(ClientSettings const& settings, MockRequestKind kind)
+    {
+        switch (kind)
         {
-            nlohmann::json const& bot = state["bot"];
-            bool inCombat = bot.value("in_combat", false);
-            bool isMoving = bot.value("is_moving", false);
-            if (inCombat || isMoving)
-                return "request_idle";
-
-            std::string missionKind = bot["mission"].value("kind", "");
-            std::string missionTarget = bot["mission"].value("target", "");
-            bool matchingObjectiveFound = false;
-            bool matchingObjectiveRemaining = false;
-            for (nlohmann::json const& quest : bot.value("active_quests", nlohmann::json::array()))
-            {
-                // Finish pending turn-ins before starting another engagement.
-                // Item objective names can differ from their source creature.
-                if (quest.value("status", "") == "complete")
-                {
-                    if (bot.value("grind_mode", false))
-                        return "request_stop_grind";
-                    uint32 questId = quest.value("id", 0u);
-                    for (auto const& giver : state.value("quest_givers_in_range", nlohmann::json::array()))
-                    {
-                        for (auto const& id : giver.value("turn_in_quest_ids", nlohmann::json::array()))
-                        {
-                            if (id == questId)
-                            {
-                                arguments["quest_id"] = questId;
-                                return "request_talk_to_quest_giver";
-                            }
-                        }
-                    }
-                    for (auto const& entity : state.value("nearby_entities", nlohmann::json::array()))
-                    {
-                        if (entity.value("type", "") != "npc")
-                            continue;
-                        for (auto const& id : entity.value("turn_in_quest_ids", nlohmann::json::array()))
-                        {
-                            if (id == questId && entity.value("entry_id", 0u) != 0)
-                            {
-                                arguments["entry_id"] = entity["entry_id"];
-                                return "request_move_hop_npc";
-                            }
-                        }
-                    }
-                    // Use only server-provided turn-in POIs on this map.
-                    for (auto const& poi : quest.value("poi", nlohmann::json::array()))
-                    {
-                        if (!poi.value("is_turn_in", false) ||
-                            poi.value("map_id", 0u) != bot.value("map_id", 0u))
-                            continue;
-                        std::string direction = poi.value("direction", "");
-                        if (direction.empty() || !state.contains("nav"))
-                            continue;
-                        auto const& nav = state["nav"];
-                        for (auto const& candidate : nav.value("candidates", nlohmann::json::array()))
-                        {
-                            if (candidate.value("can_move", false) && candidate.value("reachable", false) &&
-                                candidate.value("direction", "") == direction)
-                            {
-                                arguments["nav_epoch"] = nav["nav_epoch"];
-                                arguments["candidate_id"] = candidate["candidate_id"];
-                                return "request_move_hop";
-                            }
-                        }
-                    }
-                    return "request_idle";
-                }
-                if (quest.value("status", "") != "incomplete")
-                    continue;
-                for (nlohmann::json const& objective : quest.value("objectives", nlohmann::json::array()))
-                {
-                    if (objective.value("target_name", "") != missionTarget)
-                        continue;
-                    matchingObjectiveFound = true;
-                    if (objective.value("current", 0u) < objective.value("required", 0u))
-                        matchingObjectiveRemaining = true;
-                }
-            }
-
-            if (missionKind == "grind" && matchingObjectiveFound && !matchingObjectiveRemaining)
-            {
-                if (bot.value("grind_mode", false))
-                    return "request_stop_grind";
-            }
-
-            if (missionKind == "grind" && !missionTarget.empty())
-            {
-                if (!matchingObjectiveFound || matchingObjectiveRemaining)
-                {
-                    for (nlohmann::json const& entity : state.value("nearby_entities", nlohmann::json::array()))
-                    {
-                        if (entity.value("type", "") == "npc" && entity.value("name", "") == missionTarget)
-                        {
-                            arguments["entry_id"] = entity.value("entry_id", 0u);
-                            return "request_attack_target";
-                        }
-                    }
-
-                    if (!bot.value("grind_mode", false))
-                        return "request_enter_grind";
-                }
-            }
+            case MockRequestKind::Control:
+                return settings.mockControlEnable;
+            case MockRequestKind::PlannerLongTerm:
+            case MockRequestKind::PlannerShortTerm:
+                return settings.mockPlannerEnable;
+            case MockRequestKind::Chat:
+                return settings.mockChatEnable;
+            case MockRequestKind::Probe:
+            case MockRequestKind::Generic:
+            default:
+                // Preserve the legacy master switch for generic diagnostics and
+                // think probes. Role-specific switches only affect their role.
+                return settings.mockEnable;
         }
-
-        if (prompt.find("\"post_grind_decision\":true") == std::string::npos &&
-            prompt.find("\"post_grind_decision\": true") == std::string::npos)
-            return "request_idle";
-
-        auto firstOptionId = [&](std::string const& prefix) -> uint32
-        {
-            size_t pos = prompt.find(prefix);
-            if (pos == std::string::npos)
-                return 0;
-            pos += prefix.size();
-            size_t end = pos;
-            while (end < prompt.size() && std::isdigit(static_cast<unsigned char>(prompt[end])))
-                ++end;
-            if (end == pos)
-                return 0;
-            try { return static_cast<uint32>(std::stoul(prompt.substr(pos, end - pos))); }
-            catch (...) { return 0; }
-        };
-
-        uint32 questId = firstOptionId("turn_in_quest:");
-        if (questId == 0)
-            questId = firstOptionId("accept_quest:");
-        if (questId != 0)
-        {
-            arguments["quest_id"] = questId;
-            return "request_talk_to_quest_giver";
-        }
-        if (prompt.find("\"repair |") != std::string::npos)
-            return "request_repair";
-        if (prompt.find("\"sell_grays |") != std::string::npos)
-            return "request_vendor_sell";
-        if (prompt.find("continue_quest:") != std::string::npos ||
-            prompt.find("continue_grind") != std::string::npos)
-            return "request_enter_grind";
-        return "request_idle";
     }
 
     AmigoOllamaResult RunMockRequest(ClientSettings const& settings, std::string const& prompt, bool think)
@@ -459,11 +359,11 @@ namespace
                 break;
             case MockRequestKind::Control:
             {
-                std::string tool = settings.mockControlTool.empty() ? "request_idle" : settings.mockControlTool;
+                std::string tool = settings.mockControlTool.empty() ? "auto" : settings.mockControlTool;
                 nlohmann::json arguments = nlohmann::json::object();
                 std::string parseError;
                 if (tool == "auto")
-                    tool = MockQuestingControlTool(prompt, arguments);
+                    tool = MockQuestingControlTool(prompt, arguments, out.noOp);
                 else if (!ParseMockArguments(settings.mockControlArguments, arguments, parseError))
                 {
                     out.httpStatus = 400;
@@ -475,11 +375,14 @@ namespace
                     return out;
                 }
 
-                nlohmann::json payload = {
-                    {"name", tool},
-                    {"arguments", arguments}
-                };
-                out.text = "<tool_call>" + payload.dump() + "</tool_call>";
+                if (!out.noOp)
+                {
+                    nlohmann::json payload = {
+                        {"name", tool},
+                        {"arguments", arguments}
+                    };
+                    out.text = "<tool_call>" + payload.dump() + "</tool_call>";
+                }
                 break;
             }
             case MockRequestKind::PlannerLongTerm:
@@ -502,7 +405,7 @@ namespace
             std::chrono::steady_clock::now() - started).count());
         gLastLatencyMs.store(out.latencyMs);
 
-        if (out.text.empty())
+        if (out.text.empty() && !out.noOp)
         {
             out.error = std::string("empty mock response for ") + MockRequestKindName(kind);
             SetLastError(out.error);
@@ -547,7 +450,8 @@ namespace
             return out;
         }
 
-        if (settings.mockEnable)
+        MockRequestKind requestKind = ClassifyMockRequest(prompt);
+        if (ShouldMockRequest(settings, requestKind))
             return RunMockRequest(settings, prompt, think);
 
         CURL* curl = curl_easy_init();
@@ -621,6 +525,7 @@ namespace
             return out;
         }
 
+        bool responseFound = false;
         try
         {
             nlohmann::json j = nlohmann::json::parse(responseBuffer);
@@ -633,12 +538,16 @@ namespace
                     {
                         auto const& message = choice["message"];
                         if (message.contains("content") && message["content"].is_string())
+                        {
+                            responseFound = true;
                             out.text = message["content"].get<std::string>();
+                        }
                     }
                 }
             }
             else if (j.contains("response") && j["response"].is_string())
             {
+                responseFound = true;
                 out.text = j["response"].get<std::string>();
             }
         }
@@ -655,15 +564,28 @@ namespace
                     {
                         nlohmann::json j = nlohmann::json::parse(line);
                         if (j.contains("response") && j["response"].is_string())
+                        {
+                            responseFound = true;
                             out.text += j["response"].get<std::string>();
+                        }
                     }
                     catch (...) {}
                 }
             }
         }
 
-        if (out.text.empty())
+        if (TrimMockArg(out.text).empty())
         {
+            if (responseFound && ClassifyMockRequest(prompt) == MockRequestKind::Control)
+            {
+                // An empty control response is an intentional no-op. It must
+                // not become request_idle or trigger parser-error backoff.
+                out.noOp = true;
+                out.ok = true;
+                out.httpStatus = httpCode;
+                SetLastError("");
+                return out;
+            }
             out.error = "empty LLM response";
             SetLastError(out.error);
             return out;
@@ -733,6 +655,9 @@ void PublishOllamaClientConfig()
     gApiKey = g_AmigoLlmApiKey;
     gThinkLatencyGuardMs = g_AmigoThinkMaxLatencyMs;
     gMockEnable = g_AmigoMockEnable;
+    gMockControlEnable = g_AmigoMockControlEnable;
+    gMockPlannerEnable = g_AmigoMockPlannerEnable;
+    gMockChatEnable = g_AmigoMockChatEnable;
     gMockLatencyMs = g_AmigoMockLatencyMs;
     gMockFailEvery = g_AmigoMockFailEvery;
     if (!gMockRuntimeControlOverride)
@@ -787,6 +712,21 @@ bool IsAmigoLlmMockEnabled()
     return SnapshotSettings().mockEnable;
 }
 
+bool IsAmigoLlmMockControlEnabled()
+{
+    return SnapshotSettings().mockControlEnable;
+}
+
+bool IsAmigoLlmMockPlannerEnabled()
+{
+    return SnapshotSettings().mockPlannerEnable;
+}
+
+bool IsAmigoLlmMockChatEnabled()
+{
+    return SnapshotSettings().mockChatEnable;
+}
+
 uint32_t GetAmigoLlmMockLatencyMs()
 {
     return SnapshotSettings().mockLatencyMs;
@@ -818,6 +758,17 @@ bool SetAmigoLlmMockControlRuntime(std::string const& tool, std::string const& a
     nlohmann::json arguments;
     if (!ParseMockArguments(argumentsJson.empty() ? "{}" : argumentsJson, arguments, error))
         return false;
+    if (tool != "auto")
+    {
+        auto const* definition = FindControlAction(tool);
+        if (!definition)
+        {
+            error = "unsupported_action";
+            return false;
+        }
+        if (!ValidateControlArguments(*definition, arguments, error))
+            return false;
+    }
 
     std::lock_guard<std::mutex> lock(gSettingsMutex);
     gMockControlTool = tool;

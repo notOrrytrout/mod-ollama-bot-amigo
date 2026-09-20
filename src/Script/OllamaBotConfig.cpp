@@ -13,6 +13,9 @@ std::string g_OllamaBotControlUrl = "http://localhost:11434/api/generate";
 std::string g_AmigoLlmProvider = "ollama";
 std::string g_AmigoLlmApiKey = "";
 bool g_AmigoMockEnable = false;
+bool g_AmigoMockControlEnable = false;
+bool g_AmigoMockPlannerEnable = false;
+bool g_AmigoMockChatEnable = false;
 uint32 g_AmigoMockLatencyMs = 25;
 uint32 g_AmigoMockFailEvery = 0;
 std::string g_AmigoMockControlTool = "auto";
@@ -25,6 +28,7 @@ std::string g_OllamaBotControlPlannerModel = "ministral-3:3b";
 std::string g_OllamaBotControlPlannerLongTermModel = "";
 std::string g_OllamaBotControlPlannerShortTermModel = "";
 std::string g_OllamaBotControlControlModel = "ministral-3:3b";
+std::string g_OllamaBotControlChatModel = "";
 std::string g_OllamaBotControlPlannerPrompt = "";
 std::string g_OllamaBotControlShortTermPrompt = "";
 std::string g_OllamaBotControlControlPrompt = "";
@@ -128,12 +132,26 @@ void OllamaBotControlConfigWorldScript::OnAfterConfigLoad(bool /*reload*/)
     LoadConfig();
 }
 
+void OllamaBotControlConfigWorldScript::OnShutdown()
+{
+    LOG_INFO("server.loading", "[OllamaBotAmigo] Stopping LLM dispatcher for world shutdown.");
+    AmigoLlmDispatchStop();
+}
+
 void OllamaBotControlConfigWorldScript::LoadConfig()
 {
     // Read configuration and initialize tables/state as needed.
     g_AmigoLlmProvider = sConfigMgr->GetOption<std::string>("OllamaBotControl.Llm.Provider", "ollama");
     g_AmigoLlmApiKey = sConfigMgr->GetOption<std::string>("OllamaBotControl.Llm.ApiKey", "");
     g_AmigoMockEnable = sConfigMgr->GetOption<bool>("OllamaBotControl.Llm.Mock.Enable", false);
+    // Per-role mock switches override the legacy master default. This keeps old
+    // configs working while allowing control/planner/chat to be mixed freely.
+    g_AmigoMockControlEnable = sConfigMgr->GetOption<bool>(
+        "OllamaBotControl.Llm.Mock.Control.Enable", g_AmigoMockEnable);
+    g_AmigoMockPlannerEnable = sConfigMgr->GetOption<bool>(
+        "OllamaBotControl.Llm.Mock.Planner.Enable", g_AmigoMockEnable);
+    g_AmigoMockChatEnable = sConfigMgr->GetOption<bool>(
+        "OllamaBotControl.Llm.Mock.Chat.Enable", g_AmigoMockEnable);
     g_AmigoMockLatencyMs = sConfigMgr->GetOption<uint32>("OllamaBotControl.Llm.Mock.LatencyMs", 25);
     g_AmigoMockFailEvery = sConfigMgr->GetOption<uint32>("OllamaBotControl.Llm.Mock.FailEvery", 0);
     g_AmigoMockControlTool = sConfigMgr->GetOption<std::string>(
@@ -167,6 +185,9 @@ void OllamaBotControlConfigWorldScript::LoadConfig()
     g_OllamaBotControlPlannerLongTermModel = sConfigMgr->GetOption<std::string>("OllamaBotControl.Model.PlannerLongTerm", "");
     g_OllamaBotControlPlannerShortTermModel = sConfigMgr->GetOption<std::string>("OllamaBotControl.Model.PlannerShortTerm", "");
     g_OllamaBotControlControlModel = sConfigMgr->GetOption<std::string>("OllamaBotControl.Model.Control", "ministral-3:3b");
+    g_OllamaBotControlChatModel = sConfigMgr->GetOption<std::string>("OllamaBotControl.Model.Chat", "");
+    if (g_OllamaBotControlChatModel.empty())
+        g_OllamaBotControlChatModel = g_OllamaBotControlControlModel;
     g_OllamaBotControlBotName = sConfigMgr->GetOption<std::string>("OllamaBotControl.BotName", "Ollamatest");
     g_AmigoBotAutoLogin = sConfigMgr->GetOption<bool>("OllamaBotControl.Bot.AutoLogin", true);
     g_AmigoBotAutoLoginDelayMs = sConfigMgr->GetOption<uint32>("OllamaBotControl.Bot.AutoLoginDelayMs", 10000);

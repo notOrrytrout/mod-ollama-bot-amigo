@@ -26,6 +26,11 @@ OllamaBotControl.Url = http://localhost:11434/api/generate
 # control parser, chat path, completion queue, lifecycle, and Playerbots code
 # still run; only the LLM response is spoofed.
 OllamaBotControl.Llm.Mock.Enable = 0
+# Per-role overrides. If omitted, each role inherits Mock.Enable above.
+# This allows deterministic gameplay with natural real-LLM conversation.
+OllamaBotControl.Llm.Mock.Control.Enable = 0
+OllamaBotControl.Llm.Mock.Planner.Enable = 0
+OllamaBotControl.Llm.Mock.Chat.Enable = 0
 # Artificial worker-side latency to exercise asynchronous scheduling/backpressure.
 OllamaBotControl.Llm.Mock.LatencyMs = 25
 # Inject one failed request every N mock calls. 0 = never fail.
@@ -82,6 +87,8 @@ OllamaBotControl.DelayMs.Startup = 15000
 # Models
 ############################
 OllamaBotControl.Model.Control          = ministral-3:3b
+# Empty = use Model.Control for social replies/event chatter.
+OllamaBotControl.Model.Chat             =
 OllamaBotControl.Model.Planner          = ministral-3:3b
 OllamaBotControl.Model.PlannerLongTerm  =
 OllamaBotControl.Model.PlannerShortTerm =

@@ -1,5 +1,7 @@
 #include "Script/OllamaBotControlLoop.h"
+#include "Script/AmigoControlControllerScript.h"
 #include "Ai/ControlAction.h"
+#include "Ai/ControlContract.h"
 #include "Ai/BotMindState.h"
 #include "Script/OllamaBotConfig.h"
 #include "Bot/BotControlApi.h"
@@ -30,6 +32,7 @@
 #include "Bot/BotMission.h"
 #include "Bot/BotNeeds.h"
 #include "Bot/BotLifecycle.h"
+#include "Bot/BotNavigationPenalty.h"
 #include "LootObjectStack.h"
 #include "Script/OllamaBotPlannerRefresh.h"
 #include <array>
@@ -65,7 +68,6 @@ namespace
     constexpr uint32 kControlIntervalMs = 2500;              // 2.5s (fallback; normally overridden via config)
     constexpr uint32 kStrategicGoalChangeCooldownMs = 60000; // 60s
     constexpr float kIdlePositionEpsilon = 0.1f;
-    constexpr uint32 kIdlePenaltyStartCycles = 8;
     constexpr uint32 kOllamaFailureHoldMs = 60000;   // 60s
     constexpr uint32 kPlannerFailureDelayMs = 90000; // 90s
     constexpr uint32 kGlobalFailureWindowMs = 60000;
@@ -78,6 +80,7 @@ namespace
     // When entering grind mode, give the bot time to start fighting before requesting
     // another control action from the LLM (prevents rapid grind spam).
     constexpr uint32 kPostEnterGrindControlDelayMs = 10000; // 10 seconds
+    constexpr uint32 kNavigationTimeoutPenaltyMs = 90000;   // 90 seconds
     constexpr float kQuestGiverApproachOffsetMeters = 1.8f;
     struct DistanceBand
     {
@@ -121,6 +124,17 @@ namespace
         std::string activity;
         std::string reason;
         bool retainGrind = TryGetActivityState(bot, activity, reason) && activity == "grind";
+        for (auto const& quest : bot->getQuestStatusMap())
+        {
+            if (quest.second.Status == QUEST_STATUS_COMPLETE)
+            {
+                retainGrind = false;
+                ai->ChangeStrategy("-grind", BOT_STATE_NON_COMBAT);
+                if (activity == "grind")
+                    UpdateActivityState(bot, "quest_turn_in", "completed quest has precedence");
+                break;
+            }
+        }
         bool hadAutonomousMovement = ai->HasStrategy("rpg", BOT_STATE_NON_COMBAT) ||
                                      ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) ||
                                      ai->HasStrategy("move random", BOT_STATE_NON_COMBAT) ||
@@ -146,6 +160,7 @@ namespace
     {
         // Condensed view of bot/world state sent to the LLM.
         uint64 botGuid = 0;
+        std::string botName;
         uint32 nowMs = 0;
         Position3 pos;
         float orientation = 0.0f;
@@ -207,6 +222,8 @@ namespace
             float distance2d = 0.0f;
             float bearingDeg = 0.0f;
             std::string direction;
+            bool temporarilyBlocked = false;
+            uint32 penaltyRemainingMs = 0;
         };
         std::vector<NavCandidate> navCandidates;
         std::vector<uint32> activeQuestIds;
@@ -227,8 +244,12 @@ namespace
             std::vector<QuestObjectiveProgress> objectives;
         };
         std::vector<QuestProgress> activeQuests;
+        std::string actionableGoal;
         bool postGrindDecision = false;
         std::vector<std::string> postGrindOptions;
+        std::vector<ControlDecisionOption> decisionOptions;
+        std::unordered_map<std::string, BotServiceAvailability> serviceAvailability;
+        bool lifecycleActive = false;
         struct QuestPoi
         {
             uint32 questId = 0;
@@ -253,6 +274,7 @@ namespace
             bool isTrainer = false;
             bool isRepair = false;
             bool isFlightMaster = false;
+            std::vector<uint32> turnInQuestIds;
         };
         std::vector<NearbyEntity> nearbyEntities;
         struct QuestGiverInRange
@@ -626,7 +648,10 @@ namespace
                                         bool postGrindDecision = false)
     {
         reason.clear();
-        if (capability == ControlAction::Capability::EnterAttackPull && mission.kind != BotMissionKind::Grind)
+        if (capability == ControlAction::Capability::TalkToQuestGiver && postGrindDecision)
+            return true;
+        if (capability == ControlAction::Capability::EnterAttackPull &&
+            mission.kind != BotMissionKind::Grind && mission.kind != BotMissionKind::Quest)
         {
             reason = "targeted_attack_requires_named_grind";
             return false;
@@ -661,7 +686,7 @@ namespace
                     reason = "grind_mission_scope";
                     return false;
                 }
-                if (capability == ControlAction::Capability::EnterGrind && !TrimCopy(mission.target).empty() && !postGrindDecision)
+                if (capability == ControlAction::Capability::EnterGrind && !TrimCopy(mission.target).empty())
                 {
                     // The existing grind command is not target-scoped. Do not pretend
                     // exact named grind missions are enforced until a targeted executor exists.
@@ -698,7 +723,8 @@ namespace
         BotLifecycleAssessment lifecycle = AssessBotLifecycle(bot, ai, topNeed);
 
         const bool maintenanceOwns = lifecycle.lane == BotLifecycleLane::Maintenance &&
-                                     (lifecycle.urgent || allowOptionalMaintenance || HasActiveBotLifecycleOverlay(bot)) &&
+                                     (lifecycle.urgent || allowOptionalMaintenance || HasActiveBotLifecycleOverlay(bot) ||
+                                      HasPendingBotLifecycleService(bot)) &&
                                      CanAcquireBotLifecycleMaintenance(bot, lifecycle.urgent);
         BotLifecycleLane effectiveLane = BotLifecycleLane::Mission;
         if (lifecycle.lane == BotLifecycleLane::Combat)
@@ -1347,245 +1373,9 @@ namespace
         nlohmann::json arguments;
     };
 
-    struct ControlToolDefinition
-    {
-        // Control tool metadata for validation and mapping.
-        char const* name;
-        char const* signature;
-        ControlAction::Capability capability;
-        bool requiresDirection;
-        bool requiresDistance;
-        bool requiresQuestId;
-        bool requiresEntryId;
-        bool requiresSkill;
-        bool requiresIntent;
-        bool requiresMessage;
-        bool requiresNavEpoch;
-        bool requiresCandidateId;
-    };
+    using ControlToolDefinition = ControlActionDefinition;
 
-    const std::array<ControlToolDefinition, 20> kControlTools = {
-        ControlToolDefinition{
-            "request_idle",
-            "request_idle()",
-            ControlAction::Capability::Idle,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_move_hop",
-            "request_move_hop(nav_epoch, candidate_id)",
-            ControlAction::Capability::MoveHop,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            true},
-        ControlToolDefinition{
-            "request_move_hop_npc",
-            "request_move_hop_npc(entry_id)",
-            ControlAction::Capability::MoveHopNpc,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_enter_grind",
-            "request_enter_grind()",
-            ControlAction::Capability::EnterGrind,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_attack_target",
-            "request_attack_target(entry_id)",
-            ControlAction::Capability::EnterAttackPull,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_gather_target",
-            "request_gather_target(entry_id)",
-            ControlAction::Capability::GatherTarget,
-            false,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_stop_grind",
-            "request_stop_grind()",
-            ControlAction::Capability::StopGrind,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_stay",
-            "request_stay()",
-            ControlAction::Capability::Stay,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_unstay",
-            "request_unstay()",
-            ControlAction::Capability::Unstay,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_talk_to_quest_giver",
-            "request_talk_to_quest_giver(quest_id)",
-            ControlAction::Capability::TalkToQuestGiver,
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_hearthstone",
-            "request_hearthstone()",
-            ControlAction::Capability::Hearthstone,
-            false, false, false, false, false, false, false, false, false},
-        ControlToolDefinition{
-            "request_taxi",
-            "request_taxi()",
-            ControlAction::Capability::Taxi,
-            false, false, false, false, false, false, false, false, false},
-        ControlToolDefinition{
-            "request_fish",
-            "request_fish()",
-            ControlAction::Capability::Fish,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_profession",
-            "request_profession(skill, intent)",
-            ControlAction::Capability::UseProfession,
-            false,
-            false,
-            false,
-            false,
-            true,
-            true,
-            false,
-            false,
-            false},
-        // Turning tools added for precise orientation changes.
-        ControlToolDefinition{
-            "request_turn_left_90",
-            "request_turn_left_90()",
-            ControlAction::Capability::TurnLeft90,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_turn_right_90",
-            "request_turn_right_90()",
-            ControlAction::Capability::TurnRight90,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_turn_around",
-            "request_turn_around()",
-            ControlAction::Capability::TurnAround,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false},
-        ControlToolDefinition{
-            "request_repair",
-            "request_repair()",
-            ControlAction::Capability::Repair,
-            false, false, false, false, false, false, false, false, false},
-        ControlToolDefinition{
-            "request_vendor_sell",
-            "request_vendor_sell()",
-            ControlAction::Capability::VendorSell,
-            false, false, false, false, false, false, false, false, false},
-        ControlToolDefinition{
-            "request_trainer",
-            "request_trainer()",
-            ControlAction::Capability::Trainer,
-            false, false, false, false, false, false, false, false, false}};
+    std::vector<ControlToolDefinition> const& kControlTools = GetControlActionCatalog();
 
     bool TryExtractToolCall(std::string const &reply, ToolCall &outCall, std::string &outJson)
     {
@@ -1660,7 +1450,7 @@ namespace
         // Look up tool metadata by name.
         for (auto const& tool : kControlTools)
         {
-            if (name == tool.name)
+            if (tool.supported && name == tool.name)
             {
                 outDefinition = tool;
                 return true;
@@ -1691,71 +1481,6 @@ namespace
         outIntent = NormalizeCommandToken(arguments["intent"].get<std::string>());
         return !outSkill.empty() && !outIntent.empty();
     }
-
-    char const* DescribeControlTool(char const* name)
-    {
-        // Short descriptions used in the control prompt.
-        if (std::strcmp(name, "request_idle") == 0)
-        {
-            return "wait for the next update";
-        }
-        if (std::strcmp(name, "request_move_hop") == 0)
-        {
-            return "move using a server-provided navigation candidate (by ID)";
-        }
-        if (std::strcmp(name, "request_enter_grind") == 0)
-        {
-            return "fight nearby mobs (grind / quest objectives)";
-        }
-        if (std::strcmp(name, "request_attack_target") == 0)
-        {
-            return "attack the exact nearby creature selected by entry_id";
-        }
-        if (std::strcmp(name, "request_gather_target") == 0)
-        {
-            return "gather the exact nearby game object selected by entry_id using Playerbots loot handling";
-        }
-        if (std::strcmp(name, "request_stop_grind") == 0)
-        {
-            return "stop grinding and resume normal movement/follow";
-        }
-        if (std::strcmp(name, "request_stay") == 0)
-        {
-            return "stay in place until told otherwise";
-        }
-        if (std::strcmp(name, "request_unstay") == 0)
-        {
-            return "resume normal movement (clear stay)";
-        }
-        if (std::strcmp(name, "request_talk_to_quest_giver") == 0)
-        {
-            return "talk to a quest giver in range (accept or turn in a quest)";
-        }
-        if (std::strcmp(name, "request_hearthstone") == 0) return "use the hearthstone through Playerbots item logic";
-        if (std::strcmp(name, "request_taxi") == 0) return "use Playerbots taxi handling at a nearby flight master";
-        if (std::strcmp(name, "request_fish") == 0)
-        {
-            return "perform fishing from the current spot (no movement)";
-        }
-        if (std::strcmp(name, "request_profession") == 0)
-        {
-            return "perform a profession-related action (requires bot to have that skill)";
-        }
-        if (std::strcmp(name, "request_turn_left_90") == 0)
-        {
-            return "turn left 90 degrees";
-        }
-        if (std::strcmp(name, "request_turn_right_90") == 0)
-        {
-            return "turn right 90 degrees";
-        }
-        if (std::strcmp(name, "request_turn_around") == 0)
-        {
-            return "turn around 180 degrees";
-        }
-        return "";
-    }
-
     std::string BuildControlToolList(std::string const &prefix)
     {
         // Build a bullet list of tools for the LLM prompt.
@@ -1763,8 +1488,10 @@ namespace
         for (size_t i = 0; i < kControlTools.size(); ++i)
         {
             auto const& tool = kControlTools[i];
+            if (!tool.supported)
+                continue;
             oss << prefix << tool.signature;
-            char const* description = DescribeControlTool(tool.name);
+            char const* description = tool.description;
             if (description && description[0] != '\0')
             {
                 oss << " — " << description;
@@ -1798,7 +1525,7 @@ namespace
         oss << R"(
 
 Rules:
-- Output exactly one <tool_call> block and nothing else.
+- Output one <tool_call> block, or no output when no new action is required.
 - request_move_hop: choose a candidate from )";
         oss << stateToken;
         oss << R"(.nav.candidates by its candidate_id, and echo )";
@@ -1817,9 +1544,8 @@ Rules:
 - request_stop_grind: call this when )";
         oss << stateToken;
         oss << R"(.bot.grind_mode is true and you need to travel/quest/talk; it disables grinding.
-- request_profession: skill must be a profession/secondary skill name (e.g. \"fishing\", \"mining\", \"skinning\").
-  intent describes what you want to do with the skill (e.g. \"fish\", \"gather\", \"craft\").
-- If no valid control action exists, call request_idle.
+- request_profession supports only skill="fishing" and intent="fish".
+- If no valid control action exists, return no output.
 
 Tool call format:
 <tool_call>
@@ -2339,8 +2065,8 @@ request_profession format:
                     uint32 questId = it->second;
                     if (bot->GetQuestStatus(questId) == QUEST_STATUS_COMPLETE)
                     {
+                        entity.turnInQuestIds.push_back(questId);
                         hasTurnIn = true;
-                        break;
                     }
                 }
                 if (!hasTurnIn)
@@ -2372,13 +2098,6 @@ request_profession format:
         {
             GameObject *gameObject = ai->GetGameObject(guid);
             if (!gameObject)
-            {
-                continue;
-            }
-
-            std::string name = gameObject->GetName();
-            if (!ContainsInsensitive(name, "fire") && !ContainsInsensitive(name, "brazier") &&
-                !ContainsInsensitive(name, "torch") && !ContainsInsensitive(name, "flame"))
             {
                 continue;
             }
@@ -2419,6 +2138,36 @@ request_profession format:
             if (!quest)
             {
                 continue;
+            }
+
+            if (statusData.Status == QUEST_STATUS_COMPLETE)
+            {
+                WorldPosition origin(bot);
+                WorldPosition* closest = nullptr;
+                for (auto* destination : TravelMgr::instance().getQuestTravelDestinations(
+                         bot, questId, true, false, 0, true))
+                {
+                    if (!destination)
+                        continue;
+                    for (auto* point : destination->nextPoint(&origin, true))
+                    {
+                        if (point && point->GetMapId() == bot->GetMapId() &&
+                            (!closest || origin.distance(*point) < origin.distance(*closest)))
+                            closest = point;
+                    }
+                }
+                if (closest)
+                {
+                    BotSnapshot::QuestPoi route;
+                    route.questId = questId;
+                    route.objectiveIndex = -1;
+                    route.mapId = bot->GetMapId();
+                    route.pos = {closest->GetPositionX(), closest->GetPositionY(), closest->GetPositionZ()};
+                    route.hasZ = true;
+                    route.isTurnIn = true;
+                    results.push_back(std::move(route));
+                    continue;
+                }
             }
 
             QuestPOIVector const *poiVector = sObjectMgr->GetQuestPOIVector(questId);
@@ -2587,6 +2336,7 @@ request_profession format:
         // Gather bot state needed for planning and control.
         BotSnapshot snapshot;
         snapshot.botGuid = bot->GetGUID().GetRawValue();
+        snapshot.botName = bot->GetName();
         snapshot.pos = Position3{bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()};
         snapshot.orientation = bot->GetOrientation();
         snapshot.mapId = bot->GetMapId();
@@ -2601,6 +2351,7 @@ request_profession format:
         snapshot.lifecycleGeneration = GetBotLifecycleGeneration(bot);
         snapshot.topNeed = AssessBotNeeds(bot);
         snapshot.lifecycle = AssessBotLifecycle(bot, ai, snapshot.topNeed);
+        snapshot.lifecycleActive = HasActiveBotLifecycleOverlay(bot) || HasPendingBotLifecycleService(bot);
         {
             std::ostringstream missionText;
             missionText << snapshot.mission.KindName();
@@ -2616,6 +2367,23 @@ request_profession format:
         snapshot.nearbyEntities = BuildNearbyEntities(bot, ai);
         AppendQuestGiverNavCandidates(bot, snapshot.nearbyEntities, snapshot.navCandidates);
         snapshot.questPois = BuildQuestPois(bot);
+        for (auto const& poi : snapshot.questPois)
+        {
+            if (!poi.isTurnIn || !poi.hasZ)
+                continue;
+            WorldPosition destination(poi.mapId, poi.pos.x, poi.pos.y, poi.pos.z);
+            if (!WorldChecks::CanReach(bot, destination))
+                continue;
+            BotSnapshot::NavCandidate candidate;
+            candidate.label = "quest_turn_in:" + std::to_string(poi.questId);
+            candidate.pos = poi.pos;
+            candidate.reachable = true;
+            candidate.hasLOS = WorldChecks::IsWithinLOS(bot, destination);
+            candidate.distance2d = Distance2d(snapshot.pos, poi.pos);
+            candidate.bearingDeg = BearingDegrees(snapshot.pos, poi.pos);
+            candidate.direction = DirectionLabelFromBearing(candidate.bearingDeg);
+            snapshot.navCandidates.push_back(std::move(candidate));
+        }
 
         // Gear / equipment signal (planner + control context).
         snapshot.avgItemLevel = bot->GetAverageItemLevel();
@@ -2873,7 +2641,7 @@ request_profession format:
                                 }
                             }
                             progress.objectives.push_back(BotSnapshot::QuestObjectiveProgress{
-                                "npc_or_go",
+                                target > 0 ? "creature" : "game_object",
                                 quest->RequiredNpcOrGo[i],
                                 targetName,
                                 entry.second.CreatureOrGOCount[i],
@@ -2896,26 +2664,120 @@ request_profession format:
             }
         }
 
-        // A completed grind objective is a transition point. Give the control
-        // model a small, server-owned action list instead of an open-ended
-        // request. The normal Playerbot executors still perform the action.
-        if (snapshot.mission.kind == BotMissionKind::Grind)
+        // Build one structured set of legal choices for every mission type.
+        // The formatted list remains a prompt compatibility view only.
+        auto addDecisionOption = [&](ControlDecisionOption option, std::string formatted)
         {
-            for (auto const &quest : snapshot.activeQuests)
+            snapshot.decisionOptions.push_back(std::move(option));
+            snapshot.postGrindOptions.push_back(std::move(formatted));
+        };
+
+        bool completedQuestNeedsTurnIn = false;
+        for (auto const &quest : snapshot.activeQuests)
+        {
+            if (quest.status != QUEST_STATUS_COMPLETE)
+                continue;
+
+            completedQuestNeedsTurnIn = true;
+            if (snapshot.grindMode)
             {
-                if (quest.status == QUEST_STATUS_COMPLETE)
+                ControlDecisionOption option;
+                option.action = "request_stop_grind";
+                option.questId = quest.questId;
+                option.destinationType = "quest_turn_in";
+                option.reason = "stop grind before quest turn-in";
+                addDecisionOption(std::move(option), "stop_grind_for_turn_in");
+                continue;
+            }
+            for (auto const &giver : snapshot.questGiversInRange)
+            {
+                if (std::find(giver.turnInQuestIds.begin(), giver.turnInQuestIds.end(), quest.questId) == giver.turnInQuestIds.end())
+                    continue;
+
+                ControlDecisionOption option;
+                option.action = "request_talk_to_quest_giver";
+                option.questId = quest.questId;
+                option.targetName = giver.name;
+                option.reason = "completed quest is ready to turn in";
+                option.distance = giver.distance;
+                option.local = true;
+                option.destinationType = "quest_giver";
+                option.destinationEntry = giver.entryId;
+                addDecisionOption(std::move(option), "turn_in_quest:" + std::to_string(quest.questId) +
+                                  " | " + giver.name + " | " + DistanceText(giver.distance));
+            }
+
+            for (auto const &entity : snapshot.nearbyEntities)
+            {
+                if (entity.type != "npc" ||
+                    std::find(entity.turnInQuestIds.begin(), entity.turnInQuestIds.end(), quest.questId) == entity.turnInQuestIds.end())
+                    continue;
+
+                ControlDecisionOption option;
+                option.action = "request_move_hop_npc";
+                option.questId = quest.questId;
+                option.entryId = entity.entryId;
+                option.targetName = entity.name;
+                option.reason = "move to the server-identified quest turn-in NPC";
+                option.distance = entity.distance;
+                option.local = false;
+                option.destinationType = "quest_giver";
+                option.destinationEntry = entity.entryId;
+                addDecisionOption(std::move(option), "move_to_turn_in:" + std::to_string(entity.entryId) +
+                                  " | " + entity.name + " | " + DistanceText(entity.distance));
+            }
+
+            for (auto const &poi : snapshot.questPois)
+            {
+                if (poi.questId != quest.questId || !poi.isTurnIn || poi.mapId != snapshot.mapId)
+                    continue;
+
+                size_t bestIndex = snapshot.navCandidates.size();
+                float bestDistance = Distance2d(snapshot.pos, poi.pos);
+                for (size_t index = 0; index < snapshot.navCandidates.size(); ++index)
                 {
-                    snapshot.postGrindDecision = true;
-                    for (auto const &giver : snapshot.questGiversInRange)
-                    {
-                        if (std::find(giver.turnInQuestIds.begin(), giver.turnInQuestIds.end(), quest.questId) != giver.turnInQuestIds.end())
-                        {
-                            snapshot.postGrindOptions.push_back("turn_in_quest:" + std::to_string(quest.questId) +
-                                                               " | " + giver.name + " | " +
-                                                               DistanceText(giver.distance));
-                        }
-                    }
+                    auto const &candidate = snapshot.navCandidates[index];
+                    if (!candidate.canMove || !candidate.reachable ||
+                        Distance2d(candidate.pos, poi.pos) >= bestDistance)
+                        continue;
+                    bestIndex = index;
+                    bestDistance = Distance2d(candidate.pos, poi.pos);
                 }
+                if (bestIndex != snapshot.navCandidates.size())
+                {
+                    auto const& candidate = snapshot.navCandidates[bestIndex];
+                    ControlDecisionOption option;
+                    option.action = "request_move_hop";
+                    option.questId = quest.questId;
+                    option.reason = "move toward the server-generated quest turn-in POI";
+                    option.distance = candidate.distance2d;
+                    option.local = false;
+                    option.destinationType = "quest_turn_in_poi";
+                    option.navigationDirection = candidate.direction;
+                    option.candidateId = "nav_" + std::to_string(bestIndex);
+                    addDecisionOption(std::move(option), "move_to_turn_in_poi | " + candidate.direction +
+                                      " | " + DistanceText(candidate.distance2d));
+                }
+            }
+        }
+
+        if (!completedQuestNeedsTurnIn)
+        {
+            for (auto const& entity : snapshot.nearbyEntities)
+            {
+                bool gather = snapshot.mission.kind == BotMissionKind::Gather && entity.type == "game_object";
+                bool grind = snapshot.mission.kind == BotMissionKind::Grind && entity.type == "npc" &&
+                             snapshot.activeQuests.empty();
+                if ((!gather && !grind) || !snapshot.mission.MatchesTargetName(entity.name))
+                    continue;
+                ControlDecisionOption option;
+                option.action = gather ? "request_gather_target" : "request_attack_target";
+                option.entryId = entity.entryId;
+                option.targetName = entity.name;
+                option.distance = entity.distance;
+                option.reason = "exact configured mission target";
+                option.objectiveType = gather ? "game_object" : "creature";
+                addDecisionOption(std::move(option), "exact_mission_target | " + entity.name);
             }
             for (auto const &quest : snapshot.activeQuests)
             {
@@ -2925,52 +2787,97 @@ request_profession format:
                 {
                     if (objective.current >= objective.required || objective.targetName.empty())
                         continue;
-                    float targetDistance = 999.0f;
+
                     for (auto const &entity : snapshot.nearbyEntities)
                     {
-                        if (entity.name == objective.targetName)
-                        {
-                            targetDistance = entity.distance;
-                            break;
-                        }
+                        if (entity.type != "npc" || entity.name != objective.targetName || objective.type != "creature")
+                            continue;
+                        if (snapshot.mission.kind != BotMissionKind::Quest &&
+                            (snapshot.mission.kind != BotMissionKind::Grind ||
+                             !snapshot.mission.MatchesTargetName(entity.name)))
+                            continue;
+
+                        ControlDecisionOption option;
+                        option.action = "request_attack_target";
+                        option.questId = quest.questId;
+                        option.entryId = entity.entryId;
+                        option.targetName = objective.targetName;
+                        option.reason = "exact incomplete creature objective";
+                        option.distance = entity.distance;
+                        option.objectiveType = objective.type;
+                        option.objectiveTargetId = objective.targetId;
+                        addDecisionOption(std::move(option), "attack_objective:" + objective.targetName +
+                                          " | " + DistanceText(entity.distance));
+                        break;
                     }
-                    snapshot.postGrindDecision = true;
-                    snapshot.postGrindOptions.push_back("continue_quest:" + std::to_string(quest.questId) +
-                                                       " | " + quest.title + " | " + objective.targetName + " " +
-                                                       std::to_string(objective.current) + "/" + std::to_string(objective.required) +
-                                                       " | " + DistanceText(targetDistance));
                 }
             }
+
             for (auto const &giver : snapshot.questGiversInRange)
             {
                 for (uint32 questId : giver.availableNewQuestIds)
                 {
-                    snapshot.postGrindDecision = true;
-                    snapshot.postGrindOptions.push_back("accept_quest:" + std::to_string(questId));
+                    ControlDecisionOption option;
+                    option.action = "request_talk_to_quest_giver";
+                    option.questId = questId;
+                    option.targetName = giver.name;
+                    option.reason = "available quest from a nearby quest giver";
+                    option.distance = giver.distance;
+                    option.local = true;
+                    addDecisionOption(std::move(option), "accept_quest:" + std::to_string(questId));
                 }
             }
-            for (auto const &entity : snapshot.nearbyEntities)
+
+            for (auto const& definition : GetControlActionCatalog())
             {
-                if (entity.isRepair && snapshot.lifecycle.durabilityPct < 100)
+                if (!definition.lifecycleOwned)
+                    continue;
+                BotMaintenanceKind kind = BotMaintenanceKind::None;
+                switch (definition.capability)
                 {
-                    snapshot.postGrindDecision = true;
-                    snapshot.postGrindOptions.push_back("repair | " + entity.name + " | " + DistanceText(entity.distance));
+                    case ControlAction::Capability::VendorSell: kind = BotMaintenanceKind::BagSpace; break;
+                    case ControlAction::Capability::VendorBuyUseful: kind = BotMaintenanceKind::Supplies; break;
+                    case ControlAction::Capability::Repair: kind = BotMaintenanceKind::Repair; break;
+                    case ControlAction::Capability::Trainer: kind = BotMaintenanceKind::Training; break;
+                    default: break;
                 }
-                if (entity.isVendor && ai->GetAiObjectContext()->GetValue<uint32>("item count", "gray")->Get() > 0)
-                {
-                    snapshot.postGrindDecision = true;
-                    snapshot.postGrindOptions.push_back("sell_grays | " + entity.name + " | " + DistanceText(entity.distance));
-                }
+                auto availability = AssessBotServiceAvailability(bot, ai, kind);
+                snapshot.serviceAvailability[definition.name] = availability;
+                if (!availability.local && !availability.travel)
+                    continue;
+                ControlDecisionOption option;
+                option.action = definition.name;
+                option.reason = availability.reason;
+                option.local = availability.local;
+                option.lifecycleTravel = true;
+                addDecisionOption(std::move(option), std::string(definition.name) + " | " + availability.reason);
             }
-            if (snapshot.postGrindDecision)
+
+            if (snapshot.mission.kind == BotMissionKind::Grind && snapshot.mission.target.empty() &&
+                snapshot.activeQuests.empty() && snapshot.decisionOptions.empty())
             {
-                snapshot.postGrindOptions.emplace_back("continue_grind");
-                snapshot.postGrindOptions.emplace_back("idle");
-                std::sort(snapshot.postGrindOptions.begin(), snapshot.postGrindOptions.end());
-                snapshot.postGrindOptions.erase(std::unique(snapshot.postGrindOptions.begin(), snapshot.postGrindOptions.end()),
-                                                snapshot.postGrindOptions.end());
+                ControlDecisionOption option;
+                option.action = "request_enter_grind";
+                option.reason = "continue the configured grind mission";
+                addDecisionOption(std::move(option), "continue_grind");
             }
         }
+
+        snapshot.postGrindDecision = !snapshot.decisionOptions.empty() || completedQuestNeedsTurnIn;
+        snapshot.actionableGoal = snapshot.mission.PlannerGoal();
+        for (auto const& quest : snapshot.activeQuests)
+        {
+            if (quest.status == QUEST_STATUS_COMPLETE)
+            {
+                snapshot.actionableGoal = "Turn in the completed quest " + quest.title + ".";
+                break;
+            }
+        }
+        if (!completedQuestNeedsTurnIn && snapshot.lifecycleActive)
+            snapshot.actionableGoal = "Complete the active " + snapshot.lifecycle.MaintenanceName() + " service.";
+        std::sort(snapshot.postGrindOptions.begin(), snapshot.postGrindOptions.end());
+        snapshot.postGrindOptions.erase(std::unique(snapshot.postGrindOptions.begin(), snapshot.postGrindOptions.end()),
+                                        snapshot.postGrindOptions.end());
 
         return snapshot;
     }
@@ -3280,6 +3187,52 @@ request_profession format:
             {"post_grind_decision", bot.postGrindDecision},
             {"post_grind_options", bot.postGrindOptions},
             {"active_quests", questList}};
+        nlohmann::json decisionOptions = nlohmann::json::array();
+        for (auto const& option : bot.decisionOptions)
+        {
+            nlohmann::json arguments = nlohmann::json::object();
+            if (option.action == "request_talk_to_quest_giver")
+                arguments["quest_id"] = option.questId;
+            else if (option.action == "request_move_hop")
+            {
+                arguments["nav_epoch"] = bot.navEpoch;
+                arguments["candidate_id"] = option.candidateId;
+            }
+            else if (option.entryId)
+                arguments["entry_id"] = option.entryId;
+            bool turnIn = option.questId && std::any_of(bot.activeQuests.begin(), bot.activeQuests.end(),
+                [&](auto const& quest) { return quest.questId == option.questId && quest.status == QUEST_STATUS_COMPLETE; });
+            int priority = turnIn ? (option.action == "request_stop_grind" ? 0 : option.local ? 1 : 2) :
+                option.lifecycleTravel ? 10 : option.objectiveType.empty() ? 30 : 20;
+            decisionOptions.push_back({
+                {"action", option.action},
+                {"arguments", arguments},
+                {"turn_in", turnIn},
+                {"priority", priority},
+                {"quest_id", option.questId},
+                {"entry_id", option.entryId},
+                {"target_name", option.targetName},
+                {"reason", option.reason},
+                {"distance", option.distance},
+                {"local", option.local},
+                {"lifecycle_travel", option.lifecycleTravel},
+                {"destination_type", option.destinationType},
+                {"destination_entry", option.destinationEntry},
+                {"navigation_direction", option.navigationDirection},
+                {"candidate_id", option.candidateId},
+                {"objective_type", option.objectiveType},
+                {"objective_target_id", option.objectiveTargetId},
+                {"source_target", option.sourceTarget}
+            });
+        }
+        json["decision_options"] = std::move(decisionOptions);
+        json["bot"]["lifecycle_active"] = bot.lifecycleActive;
+        json["bot"]["actionable_goal"] = bot.actionableGoal;
+        json["bot"]["mission_goal_stale"] = bot.actionableGoal != bot.mission.PlannerGoal();
+        json["services"] = nlohmann::json::object();
+        for (auto const& [name, availability] : bot.serviceAvailability)
+            json["services"][name] = {{"local", availability.local}, {"travel", availability.travel},
+                                      {"needed", availability.needed}, {"reason", availability.reason}};
         json["world_model"] = BuildWorldModelJson();
         json["local_area_model"] = {
             {"zone", normalizedZone},
@@ -3299,7 +3252,9 @@ request_profession format:
                                      {"distance_band", DistanceBandLabelForDistance(bot.navCandidates[i].distance2d)},
                                      {"has_los", bot.navCandidates[i].hasLOS},
                                      {"reachable", bot.navCandidates[i].reachable},
-                                     {"can_move", bot.navCandidates[i].canMove}});
+                                     {"can_move", bot.navCandidates[i].canMove},
+                                     {"temporarily_blocked", bot.navCandidates[i].temporarilyBlocked},
+                                     {"penalty_remaining_ms", bot.navCandidates[i].penaltyRemainingMs}});
         }
         nlohmann::json distanceBands = nlohmann::json::array();
         for (auto const &band : kMoveHopDistanceBands)
@@ -3509,6 +3464,7 @@ request_profession format:
             << ", moving: " << (bot.isMoving ? "yes" : "no")
             << ", grind mode: " << (bot.grindMode ? "yes" : "no")
             << ", idle cycles: " << bot.idleCycles << ".\n";
+        oss << "Actionable goal: " << bot.actionableGoal << "\n";
         oss << "Mission: " << bot.mission.KindName() << " (revision " << bot.missionRevision << ")";
         if (!bot.mission.target.empty())
             oss << ", target: " << bot.mission.target;
@@ -4064,95 +4020,37 @@ If it is no longer relevant, replace it with a new single-sentence long-term goa
         return oss.str();
     }
 
-    std::string BuildControlPrompt(BotSnapshot const &bot, WorldSnapshot const &world,
-                                   std::string const &longTermGoal,
-                                   std::vector<std::string> const &shortTermGoals,
+    std::string BuildControlPrompt(BotSnapshot const& bot, WorldSnapshot const& world,
+                                   std::string const& longTermGoal,
+                                   std::vector<std::string> const& shortTermGoals,
                                    size_t shortTermIndex)
     {
-        // Compose the control prompt with goal and tool rules.
         nlohmann::json stateJson = BuildSnapshotJson(bot, world, nullptr, LlmView::Control);
         {
             std::lock_guard<std::mutex> lock(gLatestControlStateMutex);
             gLatestControlStateJson = stateJson.dump();
         }
-        const OllamaSettings settings = GetOllamaSettings();
-        std::string const& systemPrompt = GetPrompt(LLMRole::Control, settings);
         bool compact = UseCompactPromptFormat();
-
-        std::string currentShortTermGoal = CurrentShortTermGoal(shortTermGoals, shortTermIndex);
-
         std::ostringstream oss;
-        if (!systemPrompt.empty())
-        {
-            oss << systemPrompt << "\n\n";
-        }
-        if (compact)
-        {
-            oss << "LT:\n";
-            oss << (longTermGoal.empty() ? "none" : longTermGoal) << "\n\n";
+        oss << "You are a control-only executor.\n";
+        oss << "LONG_TERM_GOAL\n" << longTermGoal << "\nSHORT_TERM_GOAL\n"
+            << CurrentShortTermGoal(shortTermGoals, shortTermIndex) << "\n\n";
+        oss << (compact ? "S:\n" : "STATE_JSON\n") << stateJson.dump(compact ? -1 : 2);
+        oss << R"(
 
-            oss << "ST:\n";
-            oss << (currentShortTermGoal.empty() ? "none" : currentShortTermGoal) << "\n\n";
+INSTRUCTIONS
+- Choose only an action and its exact arguments from decision_options.
+- Prefer the lowest priority number. Completed quests require turn-in before further combat.
+- Combat, loot, recovery, active travel, and active maintenance already own execution: return no output.
+- If no legal action exists or no new action is needed, return no output and preserve the current owner.
+- Never request idle to represent no output. Waiting does not authorize random movement.
+- Service options own their travel and can start during unrelated movement.
+- A remote quest route is movement only. Talk only when a local quest-talk option exists.
+- Item objectives do not authorize creature combat without an explicit source mapping.
+- Output one <tool_call>{"name":"action","arguments":{}}</tool_call>, or no output.
 
-            oss << "S:\n";
-            oss << stateJson.dump() << "\n\n";
-        oss << R"(INSTRUCTIONS
-You are a control-only executor.
-- Output exactly one <tool_call> block (or no output).
-- No extra text or JSON outside the tool call.
-- Use LT, ST, and S to choose a valid tool.
-- If S.bot.post_grind_decision is true, choose exactly one entry from S.bot.post_grind_options. Entries are server-generated and formatted as action | target | distance. Use request_talk_to_quest_giver(quest_id) for turn_in_quest entries, request_repair() for repair, request_vendor_sell() for sell_grays, and request_enter_grind() for continue_quest.
-- S.bot.mission is authoritative. Do not choose work outside it.
-- Named gather/grind mission targets are exact; never substitute a similar name.
-- For a named grind mission, use request_attack_target(entry_id) only for a nearby entity whose name exactly matches the mission target.
-- For a named gather mission, use request_gather_target(entry_id) only for a nearby game_object whose name exactly matches the mission target.
-- If S.bot.in_combat is true or S.bot.is_moving is true, call request_idle.
-- If S.quest_givers_in_range is not empty, prioritize request_talk_to_quest_giver.
-- Recovery and loot are automatic. Service requests retain their own travel and interaction state. Choose request_vendor_sell, request_repair, or request_trainer when needed; the server handles approach and execution.
-- Taxi remains a strategic travel capability. Use it only at a matching nearby flight master.
-- Use request_move_hop_npc(entry_id) for mission-owned quest-giver or flight-master approach. Do not use it to micromanage lifecycle-owned vendor/repair/trainer travel.
-- Otherwise, prefer nearer quest objectives or nearer quest POIs when choosing movement.
-- If no control action is needed, call request_idle.
 )";
-            oss << "- If S.bot.idle_cycles >= " << kIdlePenaltyStartCycles
-                << " and you are idle, avoid request_idle; prefer a safe move_hop.\n";
-            oss << BuildControlToolInstructions("S");
-            return oss.str();
-        }
-
-        oss << "LONG_TERM_GOAL:\n";
-        oss << (longTermGoal.empty() ? "none" : longTermGoal) << "\n\n";
-
-        oss << "SHORT_TERM_GOAL:\n";
-        oss << (currentShortTermGoal.empty() ? "none" : currentShortTermGoal) << "\n\n";
-
-        oss << "STATE_JSON\n";
-        oss << stateJson.dump(2) << "\n\n";
-        oss << R"(INSTRUCTIONS
-You are a control-only executor.
-- Output exactly one <tool_call> block (or no output).
-- No extra text or JSON outside the tool call.
-- Use LONG_TERM_GOAL, SHORT_TERM_GOAL, and STATE_JSON to choose a valid tool.
-- If STATE_JSON.bot.post_grind_decision is true, choose exactly one entry from STATE_JSON.bot.post_grind_options. Entries are server-generated and formatted as action | target | distance. Use request_talk_to_quest_giver(quest_id) for turn_in_quest entries, request_repair() for repair, request_vendor_sell() for sell_grays, and request_enter_grind() for continue_quest. Do not invent quest IDs or actions.
-- STATE_JSON.bot.mission is authoritative. Do not choose work outside it.
-- Named gather/grind mission targets are exact; never substitute a similar name.
-- For a named grind mission, use request_attack_target(entry_id) only for a nearby entity whose name exactly matches the mission target.
-- For a named gather mission, use request_gather_target(entry_id) only for a nearby game_object whose name exactly matches the mission target.
-- If STATE_JSON.bot.in_combat is true, call request_idle.
-- If STATE_JSON.bot.is_moving is true, call request_idle unless STATE_JSON.bot.grind_mode is true (in that case you may call request_stop_grind).
-- If STATE_JSON.bot.grind_mode is true and you need to travel/quest/talk, call request_stop_grind.
-- If STATE_JSON.quest_givers_in_range is not empty, prioritize request_talk_to_quest_giver.
-- Recovery and loot are automatic. Service requests retain their own travel and interaction state. Choose request_vendor_sell, request_repair, or request_trainer when needed; the server handles approach and execution.
-- Taxi remains a strategic travel capability. Use it only at a matching nearby flight master.
-- Use request_move_hop_npc(entry_id) for mission-owned quest-giver or flight-master approach. Do not use it to micromanage lifecycle-owned vendor/repair/trainer travel.
-- If you intend to talk to a quest giver and your facing does not match its direction, use a turn tool first, then talk.
-- If working on incomplete quest objectives and relevant mobs are nearby, call request_enter_grind.
-- Otherwise, prefer nearer quest objectives or nearer quest POIs when choosing movement.
-- If no control action is needed, call request_idle.
-)";
-        oss << "- If STATE_JSON.bot.idle_cycles >= " << kIdlePenaltyStartCycles
-            << " and you are idle, avoid request_idle; prefer a safe move_hop.\n";
-        oss << BuildControlToolInstructions("STATE_JSON");
+        oss << BuildControlToolInstructions(compact ? "S" : "STATE_JSON");
         return oss.str();
     }
 
@@ -4175,9 +4073,9 @@ You are a control-only executor.
 
     bool HasRemainingMissionObjective(BotSnapshot const& snapshot)
     {
-        if (snapshot.mission.kind != BotMissionKind::Grind || snapshot.mission.target.empty())
-            return true;
-
+        for (auto const& quest : snapshot.activeQuests)
+            if (quest.status == QUEST_STATUS_COMPLETE)
+                return false;
         bool foundMatchingObjective = false;
         for (auto const& quest : snapshot.activeQuests)
         {
@@ -4185,7 +4083,8 @@ You are a control-only executor.
                 return false;
             for (auto const& objective : quest.objectives)
             {
-                if (objective.targetName != snapshot.mission.target)
+                if (objective.type != "creature" ||
+                    (snapshot.mission.kind != BotMissionKind::Quest && objective.targetName != snapshot.mission.target))
                     continue;
 
                 foundMatchingObjective = true;
@@ -4194,7 +4093,7 @@ You are a control-only executor.
             }
         }
 
-        return !foundMatchingObjective;
+        return !foundMatchingObjective && snapshot.activeQuests.empty();
     }
 
     bool TryParseNavCandidateIndex(std::string const &candidateId, size_t &outIndex)
@@ -4433,6 +4332,9 @@ You are a control-only executor.
 
         // Short recent buffers for movement outcomes and goal transitions.
         BotRecentHistory recentHistory;
+
+        // Temporary avoidance for navigation candidates that timed out.
+        BotNavigationPenalty navigationPenalty;
 
         // Guard to record travel outcomes into memory once.
         uint32 lastTravelRecordedMs = 0;
@@ -4681,9 +4583,19 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             switch (state.travel.LastResult())
             {
             case TravelResult::Reached:
+                if (auto cur = state.travel.Current(); cur && !cur->retryKey.empty())
+                    state.navigationPenalty.Clear(cur->retryKey);
                 state.memory.ClearFailures(key);
                 break;
             case TravelResult::TimedOut:
+                if (auto cur = state.travel.Current(); cur && !cur->retryKey.empty())
+                {
+                    state.navigationPenalty.Penalize(cur->retryKey, nowMs, kNavigationTimeoutPenaltyMs);
+                    state.forceControl.store(true, std::memory_order_relaxed);
+                    LOG_INFO("server.loading",
+                             "[OllamaBotAmigo] Temporarily blocked navigation candidate for {} after travel timeout: candidate={} duration_ms={}",
+                             bot->GetName(), cur->retryKey, kNavigationTimeoutPenaltyMs);
+                }
                 state.memory.RecordFailure(key, FailureType::Retryable, nowMs);
                 break;
             case TravelResult::Aborted:
@@ -4734,6 +4646,8 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             // While a profession session is running, do not invoke the LLM/controller.
             continue;
         }
+        if (HasAmigoPendingControl(guid))
+            continue;
 
         // Deterministic lifecycle work runs before every LLM pause/cooldown gate.
         // Existing Amigo movement/profession operations are allowed to finish, then
@@ -4872,6 +4786,25 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
         }
         BotSnapshot snapshot = BuildBotSnapshot(bot, ai);
         snapshot.nowMs = nowMs;
+
+        // A timed-out hop must not be immediately selected again when the
+        // navigation epoch changes. Candidate IDs are stable for the generated
+        // directional set, so the penalty follows the same candidate across
+        // snapshots while other directions remain available.
+        state.navigationPenalty.Prune(nowMs);
+        for (size_t i = 0; i < snapshot.navCandidates.size(); ++i)
+        {
+            auto& candidate = snapshot.navCandidates[i];
+            std::string candidateId = "nav_" + std::to_string(i);
+            uint32 penaltyRemaining = state.navigationPenalty.Remaining(candidateId, nowMs);
+            if (penaltyRemaining == 0)
+                continue;
+
+            candidate.temporarilyBlocked = true;
+            candidate.penaltyRemainingMs = penaltyRemaining;
+            candidate.canMove = false;
+        }
+
         // Publish internal navigation candidates for controller resolution (not serialized to the LLM).
         {
             BotNavState navState;
@@ -4980,6 +4913,12 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
 
         if (hasStrategicUpdate && strategicUpdate.hasUpdate)
         {
+            if (snapshot.actionableGoal != snapshot.mission.PlannerGoal())
+            {
+                strategicUpdate.plan.longTermGoal = snapshot.actionableGoal;
+                strategicUpdate.plan.shortTermGoals = {snapshot.actionableGoal};
+                strategicUpdate.refreshedShortTermGoals = true;
+            }
             std::string previousLongTermGoalForHistory = state.longTermGoal;
             bool hasLongTermGoal = !state.longTermGoal.empty();
             bool canGenerateGoal = true;
@@ -5121,7 +5060,15 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                             std::string longTermGoal;
                             bool needsShortTermGoals = false;
 
-                            if (!runLongTerm && runShortTerm && !previousLongTermGoal.empty())
+                            if (snapshot.actionableGoal != snapshot.mission.PlannerGoal())
+                            {
+                                longTermGoal = snapshot.actionableGoal;
+                                update.plan.longTermGoal = longTermGoal;
+                                update.plan.shortTermGoals = {longTermGoal};
+                                update.refreshedShortTermGoals = true;
+                                update.hasUpdate = true;
+                            }
+                            else if (!runLongTerm && runShortTerm && !previousLongTermGoal.empty())
                             {
                                 longTermGoal = previousLongTermGoal;
                                 update.plan.longTermGoal = longTermGoal;
@@ -5395,15 +5342,33 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     clearBusy();
                 };
 
-                std::string llmReply = QueryOllamaLLMOnce(prompt, g_OllamaBotControlControlModel, g_AmigoThinkControl);
+                AmigoOllamaResult llmResult = QueryOllamaLLMEx(
+                    g_OllamaBotControlControlModel, prompt, g_AmigoThinkControl);
 
-                // If cURL fails, QueryOllamaLLMOnce returns an empty string.
-                // Apply exponential backoff to avoid hammering.
-                if (llmReply.empty())
+                // A provider failure is different from an intentional control
+                // no-op. Only failures use parser/network backoff.
+                if (!llmResult.ok)
                 {
                     applyFailureBackoff();
                     return;
                 }
+
+                if (llmResult.noOp)
+                {
+                    if (g_EnableOllamaBotControlDebug || g_EnableOllamaBotAmigoDebug)
+                    {
+                        LOG_INFO("server.loading",
+                                 "[OllamaBotAmigo] Mock control no-op for {}: no server-approved decision option is currently available.",
+                                 snapshot.botName);
+                    }
+                    stateRef->nextPlannerShortTickMs.store(
+                        getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                    stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                    clearBusy();
+                    return;
+                }
+
+                std::string llmReply = llmResult.text;
 
                 ControlActionState actionState;
                 actionState.missionRevision = snapshot.missionRevision;
@@ -5456,6 +5421,15 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     clearBusy();
                     return;
                 }
+                std::string argumentError;
+                if (!ValidateControlArguments(definition, toolCall.arguments, argumentError))
+                {
+                    LogControlToolRejected(toolCall.name, argumentError);
+                    stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                    stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs());
+                    clearBusy();
+                    return;
+                }
                 if (!definition.requiresDirection && !definition.requiresDistance && !definition.requiresQuestId && !definition.requiresEntryId &&
                     !definition.requiresSkill && !definition.requiresIntent && !definition.requiresMessage &&
                     !definition.requiresNavEpoch && !definition.requiresCandidateId &&
@@ -5483,6 +5457,31 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
 
                 ControlAction action;
                 action.capability = definition.capability;
+                bool optionMatched = false;
+                for (auto const& option : snapshot.decisionOptions)
+                {
+                    if (option.action != toolCall.name)
+                        continue;
+                    if (definition.requiresQuestId && toolCall.arguments.at("quest_id") != option.questId)
+                        continue;
+                    if (definition.requiresEntryId && toolCall.arguments.at("entry_id") != option.entryId)
+                        continue;
+                    if (definition.requiresCandidateId && toolCall.arguments.at("candidate_id") != option.candidateId)
+                        continue;
+                    optionMatched = true;
+                    action.questId = option.questId;
+                    break;
+                }
+                bool explicitMock = IsAmigoLlmMockEnabled() && GetAmigoLlmMockControlTool() != "auto";
+                if (!optionMatched && (!explicitMock || definition.capability == ControlAction::Capability::EnterAttackPull ||
+                    definition.capability == ControlAction::Capability::EnterGrind))
+                {
+                    LogControlToolRejected(toolCall.name, "action_not_in_server_options");
+                    stateRef->controlState.store(LlmBotState::ControlState::Idle);
+                    stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs());
+                    clearBusy();
+                    return;
+                }
 
                 if (definition.capability == ControlAction::Capability::Idle)
                 {
@@ -5763,6 +5762,13 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 }
                 else if (definition.capability == ControlAction::Capability::EnterGrind)
                 {
+                    if (!HasRemainingMissionObjective(snapshot))
+                    {
+                        LogControlToolRejected(toolCall.name, "quest_objective_does_not_allow_grind");
+                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                        clearBusy();
+                        return;
+                    }
                     if (snapshot.grindMode)
                     {
                         LogControlToolRejected(toolCall.name, "already_grinding");
@@ -5856,7 +5862,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                         return;
                     }
 
-                    if (snapshot.isMoving)
+                    if (snapshot.isMoving && !definition.lifecycleOwned)
                     {
                         LogControlToolRejected(toolCall.name, "already_moving");
                         stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
@@ -5865,47 +5871,43 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                         return;
                     }
 
-                    bool requiresNpc = false;
-                    bool matchingNpc = false;
-                    for (auto const& entity : snapshot.nearbyEntities)
+                    if (definition.requiresNearbyTarget)
                     {
-                        if (entity.type != "npc")
-                            continue;
-
-                        if (definition.capability == ControlAction::Capability::VendorSell ||
-                            definition.capability == ControlAction::Capability::VendorBuyUseful)
+                        bool matchingNpc = false;
+                        for (auto const& entity : snapshot.nearbyEntities)
                         {
-                            requiresNpc = true;
-                            matchingNpc = matchingNpc || entity.isVendor;
+                            if (entity.type == "npc" && entity.isFlightMaster)
+                            {
+                                matchingNpc = true;
+                                break;
+                            }
                         }
-                        else if (definition.capability == ControlAction::Capability::Repair)
+                        if (!matchingNpc)
                         {
-                            requiresNpc = true;
-                            matchingNpc = matchingNpc || entity.isRepair;
-                        }
-                        else if (definition.capability == ControlAction::Capability::Trainer)
-                        {
-                            requiresNpc = true;
-                            matchingNpc = matchingNpc || entity.isTrainer;
-                        }
-                        else if (definition.capability == ControlAction::Capability::Taxi)
-                        {
-                            requiresNpc = true;
-                            matchingNpc = matchingNpc || entity.isFlightMaster;
+                            LogControlToolRejected(toolCall.name, "required_service_npc_not_nearby");
+                            stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                            stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
+                            clearBusy();
+                            return;
                         }
                     }
 
-                    if (requiresNpc && !matchingNpc)
+                    if (definition.lifecycleOwned)
                     {
-                        LogControlToolRejected(toolCall.name, "required_service_npc_not_nearby");
-                        stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
-                        stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
-                        clearBusy();
-                        return;
+                        auto service = snapshot.serviceAvailability.find(toolCall.name);
+                        if (service == snapshot.serviceAvailability.end() ||
+                            (!service->second.local && !service->second.travel))
+                        {
+                            LogControlToolRejected(toolCall.name, service == snapshot.serviceAvailability.end() ?
+                                "service_destination_unavailable" : service->second.reason);
+                            stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
+                            stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs());
+                            clearBusy();
+                            return;
+                        }
                     }
-
                     accepted = true;
-                    gateReason = "native_playerbots_service";
+                    gateReason = definition.lifecycleOwned ? "lifecycle_service_travel" : "native_playerbots_service";
                 }
                 else if (definition.capability == ControlAction::Capability::Fish)
                 {
@@ -5971,7 +5973,7 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 {
                     std::string skill;
                     std::string intent;
-                    if (!ParseProfessionArguments(toolCall.arguments, skill, intent))
+                    if (!ParseProfessionArguments(toolCall.arguments, skill, intent) || skill != "fishing" || intent != "fish")
                     {
                         LogControlToolRejected(toolCall.name, "invalid_arguments");
                         stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);

@@ -4,6 +4,8 @@
 #include "Player.h"
 #include "Define.h"
 
+bool HasAmigoPendingControl(uint64 botGuid);
+
 class AmigoControlControllerScript : public PlayerScript
 {
 public:

@@ -12,6 +12,9 @@ struct AmigoOllamaResult
     long httpStatus = 0;
     bool thinkRequested = false;
     bool thinkUsed = false;
+    // Intentional control no-op. This is not an idle tool call and must not
+    // enter the normal parser or Playerbots command path.
+    bool noOp = false;
 };
 
 // Synchronous worker-side request. Never call this from the world thread.
@@ -31,6 +34,9 @@ std::string GetAmigoLlmProvider();
 std::string GetAmigoLlmEndpoint();
 
 bool IsAmigoLlmMockEnabled();
+bool IsAmigoLlmMockControlEnabled();
+bool IsAmigoLlmMockPlannerEnabled();
+bool IsAmigoLlmMockChatEnabled();
 uint32_t GetAmigoLlmMockLatencyMs();
 uint32_t GetAmigoLlmMockFailEvery();
 

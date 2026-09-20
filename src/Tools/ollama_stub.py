@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Queue, Empty
 from typing import Any, Dict, List, Optional
+from control_catalog import CATALOG, validate_action
 
 DISTANCE_BANDS = ["very close", "close", "medium", "medium far", "far"]
 
@@ -260,6 +261,7 @@ class StubState:
             self.quest_id = max(0, qid)
 
     def enqueue_action(self, name: str, arguments: Dict[str, Any]) -> None:
+        validate_action(name, arguments)
         self.action_queue.put({"name": name, "arguments": arguments})
 
     def enqueue_long_term_goal(self, goal: str) -> None:
@@ -268,17 +270,12 @@ class StubState:
     def enqueue_short_term_goals(self, goals: List[str]) -> None:
         self.short_term_goals_queue.put(goals)
 
-    def consume_action(self) -> Dict[str, Any]:
+    def consume_action(self) -> Optional[Dict[str, Any]]:
         try:
             action = self.action_queue.get_nowait()
         except Empty:
-            action = {"name": "request_idle", "arguments": {}}
-        if not isinstance(action, dict):
-            action = {"name": "request_idle", "arguments": {}}
-        if not isinstance(action.get("name"), str) or not action.get("name"):
-            action = {"name": "request_idle", "arguments": {}}
-        if not isinstance(action.get("arguments"), dict):
-            action["arguments"] = {}
+            return None
+        validate_action(action.get("name"), action.get("arguments"))
         with self.lock:
             self.last_action_sent = action
         return action
@@ -382,8 +379,8 @@ class StubHandler(BaseHTTPRequestHandler):
 
             if role == "action":
                 tool_call = self.state.consume_action()
-                response_text = format_tool_call(tool_call["name"], tool_call.get("arguments", {}))
-                self.ui.log(f"responding with action: {tool_call['name']}")
+                response_text = format_tool_call(tool_call["name"], tool_call["arguments"]) if tool_call else ""
+                self.ui.log(f"responding with action: {tool_call['name']}" if tool_call else "no new action")
             elif role == "planner":
                 response_text = self.state.consume_planner_response(prompt)
                 preview = response_text.replace("\n", " ")

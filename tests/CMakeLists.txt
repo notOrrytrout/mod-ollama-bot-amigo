@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(amigo_control_tests LANGUAGES CXX)
+enable_testing()
+find_path(AMIGO_JSON_INCLUDE nlohmann/json.hpp REQUIRED)
+add_executable(amigo_control_tests ControlDecisionTests.cpp)
+target_compile_features(amigo_control_tests PRIVATE cxx_std_20)
+target_include_directories(amigo_control_tests PRIVATE ../src ${AMIGO_JSON_INCLUDE})
+add_test(NAME amigo_control_decisions COMMAND amigo_control_tests)

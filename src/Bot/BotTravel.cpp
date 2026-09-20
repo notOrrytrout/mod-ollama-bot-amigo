@@ -2,6 +2,8 @@
 
 #include "Player.h"
 #include "Log.h"
+#include "Bot/BotMission.h"
+#include "Bot/BotMovement.h"
 
 std::mutex BotTravelRegistry::mutex_;
 std::unordered_map<uint64_t, BotTravel*> BotTravelRegistry::travelByGuid_;
@@ -49,27 +51,40 @@ void BotTravel::Update(Player* bot, uint32_t nowMs)
     if (!active_ || !bot || !target_)
         return;
 
-    if (!bot->IsAlive())
+    auto finish = [&](TravelResult result, char const* reason)
     {
         active_ = false;
-        lastResult_ = TravelResult::Aborted;
+        lastResult_ = result;
         lastChangeMs_ = nowMs;
+        if (auto* movement = BotMovementRegistry::Get(bot->GetGUID().GetRawValue()))
+            movement->Abort(MoveReason::Travel);
+        bot->StopMoving();
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Travel completion for {}: key={} result={}",
+                 bot->GetName(), target_->key, reason);
+    };
+    if ((target_->missionRevision && !BotMissionRegistry::Instance().RevisionMatches(
+            bot->GetGUID().GetRawValue(), target_->missionRevision)) ||
+        (target_->turnInQuestId && bot->GetQuestStatus(target_->turnInQuestId) != QUEST_STATUS_COMPLETE))
+    {
+        finish(TravelResult::Aborted, "quest_or_mission_invalid");
+        return;
+    }
+
+    if (!bot->IsAlive())
+    {
+        finish(TravelResult::Aborted, "bot_dead");
         return;
     }
 
     if (Reached(bot))
     {
-        active_ = false;
-        lastResult_ = TravelResult::Reached;
-        lastChangeMs_ = nowMs;
+        finish(TravelResult::Reached, "arrival_verified");
         return;
     }
 
     if (nowMs - startMs_ > target_->timeoutMs)
     {
-        active_ = false;
-        lastResult_ = TravelResult::TimedOut;
-        lastChangeMs_ = nowMs;
+        finish(TravelResult::TimedOut, "travel_timeout");
         return;
     }
 }

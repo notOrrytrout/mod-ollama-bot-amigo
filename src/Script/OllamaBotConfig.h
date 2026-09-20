@@ -13,6 +13,9 @@ extern std::string g_AmigoLlmApiKey;
 // dispatcher/planner/control/chat paths, but the HTTP call is replaced with
 // deterministic canned responses.
 extern bool g_AmigoMockEnable;
+extern bool g_AmigoMockControlEnable;
+extern bool g_AmigoMockPlannerEnable;
+extern bool g_AmigoMockChatEnable;
 extern uint32 g_AmigoMockLatencyMs;
 extern uint32 g_AmigoMockFailEvery;
 extern std::string g_AmigoMockControlTool;
@@ -25,6 +28,7 @@ extern std::string g_OllamaBotControlPlannerModel;
 extern std::string g_OllamaBotControlPlannerLongTermModel;
 extern std::string g_OllamaBotControlPlannerShortTermModel;
 extern std::string g_OllamaBotControlControlModel;
+extern std::string g_OllamaBotControlChatModel;
 extern std::string g_OllamaBotControlPlannerPrompt;
 extern std::string g_OllamaBotControlShortTermPrompt;
 extern std::string g_OllamaBotControlControlPrompt;
@@ -93,6 +97,7 @@ public:
     OllamaBotControlConfigWorldScript();
     void OnStartup() override;
     void OnAfterConfigLoad(bool reload) override;
+    void OnShutdown() override;
 
 private:
     void LoadConfig();

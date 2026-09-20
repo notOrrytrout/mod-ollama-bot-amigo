@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 // Travel semantics layer (Playerbots-inspired): a destination has a radius,
 // completion rules, and failure classification.
@@ -28,11 +29,19 @@ enum class TravelResult
 // Keep our semantic target type in a distinct name to avoid ODR/type clashes.
 struct AmigoTravelTarget
 {
+    AmigoTravelTarget() = default;
+    AmigoTravelTarget(std::string targetKey, WorldPosition const& targetDest, float targetRadius, uint32_t targetTimeout)
+        : key(std::move(targetKey)), dest(targetDest), radius(targetRadius), timeoutMs(targetTimeout) {}
+
     // Opaque key for memory/diagnostics (not shown to the LLM).
     std::string key;
     WorldPosition dest;
     float radius = 2.5f;           // meters
     uint32_t timeoutMs = 120000;   // 2 minutes default safety timeout
+    uint64_t missionRevision = 0;
+    uint32_t turnInQuestId = 0;
+    // Stable retry key for temporary avoidance after a failed navigation hop.
+    std::string retryKey;
 };
 
 class BotTravel

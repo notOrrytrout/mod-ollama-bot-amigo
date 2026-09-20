@@ -37,13 +37,16 @@ bool AmigoCommandScript::HandleStatus(ChatHandler* handler)
         stats.workers, stats.queued, stats.inFlight, stats.pendingCompletions,
         stats.submitted, stats.completed, stats.droppedQueueFull, stats.failed));
     handler->SendSysMessage(fmt::format(
-        "Amigo LLM provider={} endpoint='{}' planner='{}' control='{}' think_status={} last_latency_ms={}",
+        "Amigo LLM provider={} endpoint='{}' planner='{}' control='{}' chat='{}' think_status={} last_latency_ms={}",
         GetAmigoLlmProvider(), GetAmigoLlmEndpoint(),
-        g_OllamaBotControlPlannerModel, g_OllamaBotControlControlModel,
+        g_OllamaBotControlPlannerModel, g_OllamaBotControlControlModel, g_OllamaBotControlChatModel,
         GetOllamaThinkCapabilityStatus(), GetOllamaLastLatencyMs()));
     handler->SendSysMessage(fmt::format(
-        "Amigo mock: enabled={} latency_ms={} fail_every={} tool={} args={}",
+        "Amigo mock: legacy_default={} control={} planner={} chat={} latency_ms={} fail_every={} tool={} args={}",
         IsAmigoLlmMockEnabled() ? "yes" : "no",
+        IsAmigoLlmMockControlEnabled() ? "mock" : "real",
+        IsAmigoLlmMockPlannerEnabled() ? "mock" : "real",
+        IsAmigoLlmMockChatEnabled() ? "mock" : "real",
         GetAmigoLlmMockLatencyMs(), GetAmigoLlmMockFailEvery(),
         GetAmigoLlmMockControlTool(), GetAmigoLlmMockControlArguments()));
     handler->SendSysMessage(fmt::format(

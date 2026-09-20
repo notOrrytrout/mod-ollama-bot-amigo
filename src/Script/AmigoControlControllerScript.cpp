@@ -318,6 +318,7 @@ namespace
 
     struct PendingQuestGiverFollowup
     {
+        uint64 missionRevision = 0;
         uint32 questId = 0;
         ObjectGuid questGiverGuid;
         uint32 startedMs = 0;
@@ -347,8 +348,15 @@ namespace
 
         PendingQuestGiverFollowup& pending = it->second;
         uint32 nowMs = getMSTime();
+        if (!BotMissionRegistry::Instance().RevisionMatches(guid, pending.missionRevision))
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Quest interaction failed: stale_mission for {}", bot->GetName());
+            pendingQuestGiverFollowups.erase(it);
+            return;
+        }
         if (pending.startedMs == 0 || nowMs - pending.startedMs > kQuestTurnInFollowupTimeoutMs)
         {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Quest interaction failed: interaction_timeout for {}", bot->GetName());
             pendingQuestGiverFollowups.erase(it);
             return;
         }
@@ -404,6 +412,8 @@ namespace
             {
                 return;
             }
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Quest completion verified for {}: quest_id={} rewarded=true",
+                     bot->GetName(), pending.questId);
             if (!pending.acceptDone)
             {
                 tryAcceptAll();
@@ -474,6 +484,11 @@ AmigoControlControllerScript::AmigoControlControllerScript()
 {
 }
 
+bool HasAmigoPendingControl(uint64 botGuid)
+{
+    return pendingQuestGiverFollowups.find(botGuid) != pendingQuestGiverFollowups.end();
+}
+
 void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*diff*/)
 {
     // Drain queued control actions and translate them to Playerbot commands.
@@ -495,6 +510,8 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
 
     // Follow up on prior quest giver interactions even if no new control action is dequeued this tick.
     MaybeHandleQuestGiverFollowup(player, ai);
+    if (HasAmigoPendingControl(player->GetGUID().GetRawValue()))
+        return;
 
     ControlActionState actionState;
     uint64 guid = player->GetGUID().GetRawValue();
@@ -539,15 +556,6 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
 
     BotSnapshot snapshot = BuildBotSnapshot(player);
 
-    if (snapshot.isMoving &&
-        actionState.action.capability != ControlAction::Capability::Idle &&
-        actionState.action.capability != ControlAction::Capability::StopGrind)
-    {
-        // When the bot is being manually moved (e.g. playerbots "bot self"), do not inject actions.
-        LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored control action while bot is moving for {}", player->GetName());
-        return;
-    }
-
     if (snapshot.inCombat)
     {
         LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored control action during combat for {}", player->GetName());
@@ -565,9 +573,20 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
     }
     if (serviceKind != BotMaintenanceKind::None)
     {
-        bool accepted = RequestBotLifecycleService(player, serviceKind);
-        LOG_INFO("server.loading", "[OllamaBotAmigo] Service request for {}: {} accepted={}",
-                 player->GetName(), CapabilityName(actionState.action.capability), accepted);
+        std::string reason;
+        bool accepted = RequestBotLifecycleService(player, serviceKind, reason);
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Service request for {}: {} accepted={} reason={}",
+                 player->GetName(), CapabilityName(actionState.action.capability), accepted, reason);
+        return;
+    }
+
+    if (snapshot.isMoving &&
+        actionState.action.capability != ControlAction::Capability::Idle &&
+        actionState.action.capability != ControlAction::Capability::StopGrind)
+    {
+        // Service requests were handled above. Other actions must wait for
+        // their current movement owner to finish.
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Ignored control action while bot is moving for {}", player->GetName());
         return;
     }
 
@@ -679,6 +698,8 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         std::ostringstream travelKey;
         travelKey << "move_hop_npc:entry:" << actionState.action.npcEntryId;
         AmigoTravelTarget targetSpec{travelKey.str(), dest, 2.5f, timeoutMs};
+        targetSpec.missionRevision = actionState.missionRevision;
+        targetSpec.turnInQuestId = actionState.action.questId;
         travel->Begin(targetSpec, nowMs);
         return;
     }
@@ -873,6 +894,9 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         std::ostringstream travelKey;
         travelKey << "move_hop:candidate:" << actionState.action.navEpoch << ":" << actionState.action.navCandidateId;
         AmigoTravelTarget targetSpec{travelKey.str(), dest, 2.5f, timeoutMs};
+        targetSpec.missionRevision = actionState.missionRevision;
+        targetSpec.turnInQuestId = actionState.action.questId;
+        targetSpec.retryKey = actionState.action.navCandidateId;
         travel->Begin(targetSpec, nowMs);
         return;
     }
@@ -897,7 +921,8 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         }
 
         BotMissionState missionState = BotMissionRegistry::Instance().Get(guid);
-        if (missionState.mission.kind != BotMissionKind::Grind || missionState.mission.target.empty())
+        if (missionState.mission.kind != BotMissionKind::Quest &&
+            (missionState.mission.kind != BotMissionKind::Grind || missionState.mission.target.empty()))
         {
             LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting targeted attack outside a named grind mission for {}", player->GetName());
             return;
@@ -910,6 +935,23 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
             LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting targeted attack for {}: entry_id={} is not a live attackable exact mission target",
                      player->GetName(), actionState.action.npcEntryId);
             return;
+        }
+
+        if (actionState.action.questId)
+        {
+            auto const* quest = sObjectMgr->GetQuestTemplate(actionState.action.questId);
+            auto const& statuses = player->getQuestStatusMap();
+            auto status = statuses.find(actionState.action.questId);
+            bool remaining = false;
+            if (quest && status != statuses.end() && status->second.Status == QUEST_STATUS_INCOMPLETE)
+                for (uint8 index = 0; index < QUEST_OBJECTIVES_COUNT; ++index)
+                    remaining = remaining || (quest->RequiredNpcOrGo[index] == static_cast<int32>(target->GetEntry()) &&
+                        status->second.CreatureOrGOCount[index] < quest->RequiredNpcOrGoCount[index]);
+            if (!remaining)
+            {
+                LOG_INFO("server.loading", "[OllamaBotAmigo] Attack rejected: objective_invalid for {}", player->GetName());
+                return;
+            }
         }
 
         player->SetSelection(target->GetGUID());
@@ -1083,6 +1125,12 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
     if (actionState.action.capability == ControlAction::Capability::TalkToQuestGiver && actionState.action.questId != 0)
     {
         WorldObject* questGiver = FindBestQuestGiverForQuestId(player, ai, actionState.action.questId);
+        if (!questGiver)
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Quest interaction rejected: quest_giver_not_in_range for {}",
+                     player->GetName());
+            return;
+        }
         if (questGiver)
         {
             ObjectGuid qg = questGiver->GetGUID();
@@ -1096,6 +1144,7 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
             }
 
             PendingQuestGiverFollowup pending;
+            pending.missionRevision = actionState.missionRevision;
             pending.questId = actionState.action.questId;
             pending.questGiverGuid = qg;
             pending.startedMs = getMSTime();

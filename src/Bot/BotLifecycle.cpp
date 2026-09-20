@@ -1,6 +1,8 @@
 #include "Bot/BotLifecycle.h"
 
 #include "Bot/BotControlApi.h"
+#include "Bot/BotMovement.h"
+#include "Bot/BotTravel.h"
 #include "Util/PlayerbotsCompat.h"
 #include "Playerbots.h"
 #include "ChooseTravelTargetAction.h"
@@ -142,7 +144,7 @@ namespace
         {
         }
 
-        bool Select(std::vector<NPCFlags> const& flags)
+        bool Select(std::vector<NPCFlags> const& flags, bool apply = true)
         {
             if (!botAI || !botAI->GetAiObjectContext())
                 return false;
@@ -154,12 +156,14 @@ namespace
             TravelTarget nextTarget(botAI);
             if (!SetNpcFlagTarget(&nextTarget, flags))
                 return false;
-
-            setNewTarget(&nextTarget, oldTarget);
+            if (!nextTarget.getPosition() || nextTarget.getPosition()->GetMapId() != botAI->GetBot()->GetMapId())
+                return false;
+            if (apply)
+                setNewTarget(&nextTarget, oldTarget);
             return true;
         }
 
-        bool SelectTrainerWithLearnableSpell()
+        bool SelectTrainerWithLearnableSpell(bool apply = true)
         {
             if (!botAI || !botAI->GetAiObjectContext() || !botAI->GetBot())
                 return false;
@@ -203,13 +207,14 @@ namespace
                 });
 
             std::vector<WorldPosition*> points = destination->nextPoint(const_cast<WorldPosition*>(&botPos), true);
-            if (points.empty())
+            if (points.empty() || points.front()->GetMapId() != player->GetMapId())
                 return false;
 
             TravelTarget nextTarget(botAI);
             nextTarget.setTarget(destination, points.front());
             nextTarget.setForced(true);
-            setNewTarget(&nextTarget, oldTarget);
+            if (apply)
+                setNewTarget(&nextTarget, oldTarget);
             return true;
         }
     };
@@ -392,8 +397,6 @@ namespace
                 break;
             case BotMaintenanceKind::Training:
                 started = ExecutePlayerbotAction(bot, "trainer", "learn");
-                if (started)
-                    runtime.trainingDue = false;
                 break;
             case BotMaintenanceKind::None:
             default:
@@ -638,14 +641,106 @@ uint64 SynchronizeBotLifecycleLane(Player const* bot, BotLifecycleLane lane)
 
 bool RequestBotLifecycleService(Player* bot, BotMaintenanceKind kind)
 {
+    std::string reason;
+    return RequestBotLifecycleService(bot, kind, reason);
+}
+
+BotServiceAvailability AssessBotServiceAvailability(Player* bot, PlayerbotAI* ai, BotMaintenanceKind kind)
+{
+    BotServiceAvailability out;
+    if (!bot || !ai || !bot->IsAlive() || kind == BotMaintenanceKind::None)
+    {
+        out.reason = "service_invalid_for_bot";
+        return out;
+    }
+    uint32 count = 0;
+    uint8 durability = 100;
+    if (kind == BotMaintenanceKind::BagSpace)
+        out.needed = TryReadValue(ai, "item count", "gray", count) && count > 0;
+    else if (kind == BotMaintenanceKind::Repair)
+        out.needed = TryReadValue(ai, "durability", durability) && durability < 100;
+    else if (kind == BotMaintenanceKind::Training)
+        out.needed = true; // The trainer selection checks eligibility and cost.
+    else if (kind == BotMaintenanceKind::Supplies)
+    {
+        out.needed = TryReadValue(ai, "item count", "food", count) && count < kLowFoodCount;
+        if (bot->GetMaxPower(POWER_MANA))
+            out.needed = (TryReadValue(ai, "item count", "drink", count) && count < kLowDrinkCount) || out.needed;
+        if (bot->getClass() == CLASS_HUNTER)
+            out.needed = (TryReadValue(ai, "item count", "ammo", count) && count < kLowHunterAmmoCount) || out.needed;
+    }
+    if (!out.needed)
+    {
+        out.reason = "service_not_needed";
+        return out;
+    }
+    out.local = FindNearestServiceNpc(bot, ai, kind) != nullptr;
+    if (!out.local)
+    {
+        AmigoServiceTravelSelector selector(ai);
+        out.travel = kind == BotMaintenanceKind::Training ? selector.SelectTrainerWithLearnableSpell(false) :
+            selector.Select(ServiceFlags(kind), false);
+    }
+    if (out.local || out.travel)
+        out.reason = out.local ? "service_available_locally" : "service_available_through_travel";
+    return out;
+}
+
+bool RequestBotLifecycleService(Player* bot, BotMaintenanceKind kind, std::string& reason)
+{
+    reason.clear();
     if (!bot || kind == BotMaintenanceKind::None)
+    {
+        reason = "service_invalid_for_bot";
         return false;
+    }
     std::lock_guard<std::mutex> lock(g_lifecycleMutex);
     LifecycleRuntime& runtime = g_lifecycle[BotGuid(bot)];
-    if (runtime.active || (runtime.retryAfterMs && getMSTime() < runtime.retryAfterMs))
+    if (runtime.active)
+    {
+        reason = runtime.kind == kind ? "service_busy_same_kind" : "service_busy";
         return false;
+    }
+    if (runtime.retryAfterMs && getMSTime() < runtime.retryAfterMs)
+    {
+        reason = "service_backoff";
+        return false;
+    }
+    if (runtime.requested != BotMaintenanceKind::None)
+    {
+        if (runtime.requested == kind)
+        {
+            reason = "service_already_queued";
+            return true;
+        }
+        reason = "service_busy";
+        return false;
+    }
+    PlayerbotAI* ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    auto availability = AssessBotServiceAvailability(bot, ai, kind);
+    if (!availability.local && !availability.travel)
+    {
+        reason = availability.reason;
+        return false;
+    }
     runtime.requested = kind;
+    if (auto* movement = BotMovementRegistry::Get(BotGuid(bot)))
+        movement->Abort(MoveReason::Travel);
+    if (auto* travel = BotTravelRegistry::Get(BotGuid(bot)))
+        travel->Abort(getMSTime());
+    bot->StopMoving();
+    reason = "service_queued_for_lifecycle_travel";
     return true;
+}
+
+bool HasPendingBotLifecycleService(Player const* bot)
+{
+    if (!bot)
+        return false;
+
+    std::lock_guard<std::mutex> lock(g_lifecycleMutex);
+    auto it = g_lifecycle.find(BotGuid(bot));
+    return it != g_lifecycle.end() && it->second.requested != BotMaintenanceKind::None;
 }
 
 bool ServiceBotLifecycle(Player* bot,
@@ -691,7 +786,7 @@ bool ServiceBotLifecycle(Player* bot,
 
     if (!runtime.active && runtime.retryAfterMs != 0 && nowMs < runtime.retryAfterMs)
         return false;
-    if (!runtime.active && !assessment.urgent && !allowOptionalStart)
+    if (!runtime.active && !assessment.urgent && !allowOptionalStart && runtime.requested == BotMaintenanceKind::None)
         return false;
 
     if (!runtime.active)
@@ -738,12 +833,17 @@ bool ServiceBotLifecycle(Player* bot,
                               assessment.ammoCount > runtime.supplyAmmoCount;
         if (improved)
         {
+            if (runtime.requested == BotMaintenanceKind::Supplies)
+            {
+                ReleaseOverlay(bot, ai, runtime, missionRevision, "supplies_inventory_progress_verified");
+                return true;
+            }
             runtime.supplyFoodCount = assessment.foodCount;
             runtime.supplyDrinkCount = assessment.drinkCount;
             runtime.supplyAmmoCount = assessment.ammoCount;
             runtime.supplyLastProgressMs = nowMs;
         }
-        else if (runtime.supplyLastProgressMs != 0 &&
+        else if (runtime.lastServiceAttemptMs != 0 && runtime.supplyLastProgressMs != 0 &&
                  nowMs - runtime.supplyLastProgressMs >= kSupplyServiceFailureTimeoutMs)
         {
             runtime.retryAfterMs = nowMs + kMaintenanceRetryBackoffMs;
@@ -775,9 +875,12 @@ bool ServiceBotLifecycle(Player* bot,
         (void)serviceNpc;
         if (runtime.lastServiceAttemptMs == 0 || nowMs - runtime.lastServiceAttemptMs >= kServiceRetryDelayMs)
         {
+            if (runtime.lastServiceAttemptMs == 0)
+                runtime.supplyLastProgressMs = nowMs;
             runtime.lastServiceAttemptMs = nowMs;
+            auto spellsBefore = bot->GetSpellMap().size();
             const bool serviceStarted = PerformLocalService(bot, ai, runtime);
-            bool serviceComplete = serviceStarted;
+            bool serviceComplete = false;
             if (runtime.requested == BotMaintenanceKind::BagSpace)
             {
                 uint32 grayCount = 0;
@@ -788,9 +891,19 @@ bool ServiceBotLifecycle(Player* bot,
                 uint8 durability = 0;
                 serviceComplete = TryReadValue(ai, "durability", durability) && durability == 100;
             }
-            if (runtime.requested != BotMaintenanceKind::None && serviceComplete)
+            if (runtime.kind == BotMaintenanceKind::Training)
             {
-                ReleaseOverlay(bot, ai, runtime, missionRevision, "requested_service_executed");
+                serviceComplete = bot->GetSpellMap().size() > spellsBefore ||
+                    !TrainerHasAffordableLearnableSpell(bot, ai, serviceNpc->GetEntry());
+                if (serviceComplete)
+                    runtime.trainingDue = false;
+            }
+            LOG_INFO("server.loading", "[OllamaBotAmigo] Service interaction for {}: started={} complete={}",
+                     bot->GetName(), serviceStarted, serviceComplete);
+            if ((runtime.requested != BotMaintenanceKind::None || runtime.kind == BotMaintenanceKind::Training) && serviceComplete)
+            {
+                ReleaseOverlay(bot, ai, runtime, missionRevision,
+                               runtime.kind == BotMaintenanceKind::Training ? "training_completion_verified" : "requested_service_executed");
                 return true;
             }
 

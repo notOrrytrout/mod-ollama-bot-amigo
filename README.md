@@ -144,21 +144,34 @@ Role-specific system prompts are configured via:
 
 ## Control Tool Calls
 
-Each control response must be exactly one `<tool_call>` block (no extra text). Supported tools:
+Control returns one tool call selected from `decision_options`, or empty output when no new action is required.
+Empty output preserves the active owner. Mock `auto` never emits an idle tool call.
+Taxi and hearthstone are unavailable until they have retained destination completion checks.
+The following table is generated from `src/Ai/ControlAction.cpp`.
 
-- `request_idle`
-- `request_move_hop` (nav_epoch + candidate_id)
-- `request_move_hop_npc` (entry_id)
-- `request_enter_grind`
-- `request_stop_grind`
-- `request_stay`
-- `request_unstay`
-- `request_talk_to_quest_giver` (quest_id)
-- `request_fish`
-- `request_profession` (skill + intent; only fishing is implemented)
-- `request_turn_left_90`
-- `request_turn_right_90`
-- `request_turn_around`
+<!-- control-catalog:start -->
+| Tool | Completion |
+| --- | --- |
+| `request_idle()` | the waiting state remains unchanged |
+| `request_move_hop(nav_epoch, candidate_id)` | the candidate reaches its arrival radius |
+| `request_move_hop_npc(entry_id)` | the NPC is in interaction range |
+| `request_enter_grind()` | Playerbots enters grind strategy |
+| `request_attack_target(entry_id)` | the target is acted on or objective progress changes |
+| `request_gather_target(entry_id)` | the object is added to Playerbots loot handling |
+| `request_stop_grind()` | grind mode is cleared |
+| `request_stay()` | the stay strategy is active |
+| `request_unstay()` | the stay strategy is cleared |
+| `request_talk_to_quest_giver(quest_id)` | the quest is rewarded or accepted |
+| `request_fish()` | the fishing cycle succeeds or times out |
+| `request_profession(skill, intent)` | the supported profession cycle completes |
+| `request_turn_left_90()` | orientation changes |
+| `request_turn_right_90()` | orientation changes |
+| `request_turn_around()` | orientation changes |
+| `request_repair()` | durability reaches 100 percent |
+| `request_vendor_sell()` | requested gray-item count reaches zero |
+| `request_vendor_buy_useful()` | food, drink, or ammunition count increases |
+| `request_trainer()` | an eligible spell is learned or no eligible spell remains |
+<!-- control-catalog:end -->
 
 Notes:
 - `request_move_hop` must echo `STATE_JSON.nav.nav_epoch` and choose a `candidate_id` from `STATE_JSON.nav.candidates` (only choose candidates where `can_move` is true, and preferably where `reachable` is true).
@@ -305,3 +318,19 @@ Clear the runtime override with:
 ```text
 amigo mock clear
 ```
+
+
+## Independent mock roles
+
+Mocking can be enabled independently for gameplay control, planning, and social/chat requests.
+The legacy `OllamaBotControl.Llm.Mock.Enable` value is only the default inherited by a role when its role-specific key is omitted.
+
+```ini
+# Example: deterministic gameplay, real oMLX conversation
+OllamaBotControl.Llm.Mock.Enable = 0
+OllamaBotControl.Llm.Mock.Control.Enable = 1
+OllamaBotControl.Llm.Mock.Planner.Enable = 1
+OllamaBotControl.Llm.Mock.Chat.Enable = 0
+```
+
+`Mock.Chat.Enable = 0` sends direct social replies and event chatter through the configured real LLM provider. `Mock.Control.Enable = 1` keeps action selection on the deterministic mock path.

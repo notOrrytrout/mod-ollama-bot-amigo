@@ -145,7 +145,7 @@ namespace
         uint64 speakerGuid = speaker->GetGUID().GetRawValue();
         std::string speakerName = speaker->GetName();
         std::string prompt = BuildChatPrompt(botGuid, speakerName, message);
-        std::string model = g_OllamaBotControlControlModel;
+        std::string model = g_OllamaBotControlChatModel;
 
         AmigoSocialIntent intent = ParseIntent(speaker, message);
         if (intent.kind != AmigoSocialIntentKind::None)
@@ -224,7 +224,7 @@ namespace
             prompt << "Personality: " << g_AmigoPersonalityPrompt << "\n";
         prompt << "Current mind state:\n" << AmigoMindBuildPromptContext(botGuid, 2);
 
-        std::string model = g_OllamaBotControlControlModel;
+        std::string model = g_OllamaBotControlChatModel;
         AmigoLlmDispatchSubmit([botGuid, promptText = prompt.str(), model = std::move(model)]() mutable
         {
             AmigoOllamaResult result = QueryOllamaLLMEx(model, promptText, false);

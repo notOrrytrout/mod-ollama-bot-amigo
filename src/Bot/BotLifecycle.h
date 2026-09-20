@@ -66,6 +66,18 @@ bool ServiceBotLifecycle(Player* bot,
 bool HasActiveBotLifecycleOverlay(Player const* bot);
 // Retain an explicit service request through travel, recovery, and interaction.
 bool RequestBotLifecycleService(Player* bot, BotMaintenanceKind kind);
+bool RequestBotLifecycleService(Player* bot, BotMaintenanceKind kind, std::string& reason);
+bool HasPendingBotLifecycleService(Player const* bot);
+
+struct BotServiceAvailability
+{
+    bool local = false;
+    bool travel = false;
+    bool needed = false;
+    std::string reason = "service_destination_unavailable";
+};
+
+BotServiceAvailability AssessBotServiceAvailability(Player* bot, PlayerbotAI* ai, BotMaintenanceKind kind);
 // False during a short retry backoff after a maintenance route times out.
 // Urgent maintenance is never suppressed by this backoff.
 bool CanAcquireBotLifecycleMaintenance(Player const* bot, bool urgent);

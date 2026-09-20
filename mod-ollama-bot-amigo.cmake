@@ -40,3 +40,7 @@ if(TARGET modules)
     target_include_directories(modules PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
     
 endif()
+
+if(BUILD_TESTING AND NOT TARGET amigo_control_tests)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/tests ${CMAKE_BINARY_DIR}/amigo-control-tests)
+endif()
