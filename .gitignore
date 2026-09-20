@@ -1,2 +1,5 @@
 .DS_Store
 *.pyc
+PLAN.md
+quick-rebuild.sh
+build/
