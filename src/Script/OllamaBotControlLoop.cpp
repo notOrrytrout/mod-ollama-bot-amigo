@@ -81,6 +81,13 @@ namespace
     // another control action from the LLM (prevents rapid grind spam).
     constexpr uint32 kPostEnterGrindControlDelayMs = 10000; // 10 seconds
     constexpr uint32 kNavigationTimeoutPenaltyMs = 90000;   // 90 seconds
+
+    struct LootLifecycleRuntime
+    {
+        uint32 lastActionMs = 0;
+    };
+
+    std::unordered_map<uint64, LootLifecycleRuntime> lootLifecycle;
     constexpr float kQuestGiverApproachOffsetMeters = 1.8f;
     struct DistanceBand
     {
@@ -785,28 +792,73 @@ namespace
 
         if (lifecycle.lane == BotLifecycleLane::Loot)
         {
-            // Drive Playerbots' existing loot state machine directly. These
-            // actions retain Playerbots' own distance, ownership, movement,
-            // lock/skill, and open-loot checks. Repeated ticks advance from
-            // target selection to approach and finally opening the target.
+            // Drive Playerbots' existing loot actions as a small state machine.
+            // Do not select, move, and open in one tick. Playerbots owns the
+            // actual loot rules; Amigo only chooses the next valid stage.
+            constexpr uint32 kLootRetryIntervalMs = 1000;
+            uint64 guid = bot->GetGUID().GetRawValue();
+            LootLifecycleRuntime& lootState = lootLifecycle[guid];
+            uint32 nowMs = getMSTime();
+            if (lootState.lastActionMs != 0 && nowMs - lootState.lastActionMs < kLootRetryIntervalMs)
+                return true;
+            lootState.lastActionMs = nowMs;
+
+            bool selected = false;
+            bool moved = false;
+            bool opened = false;
+            std::string lootStage = "no_target";
             if (AiObjectContext* context = ai->GetAiObjectContext())
             {
-                if (LootObjectStack* availableLoot = context->GetValue<LootObjectStack*>("available loot")->Get())
+                Value<LootObject>* targetValue = context->GetValue<LootObject>("loot target");
+                LootObject target = targetValue ? targetValue->Get() : LootObject();
+
+                if (target.IsEmpty())
                 {
-                    LootObject pendingLoot = availableLoot->GetLoot();
-                    if (!pendingLoot.IsEmpty())
-                        context->GetValue<LootObject>("loot target")->Set(pendingLoot);
+                    if (LootObjectStack* availableLoot = context->GetValue<LootObjectStack*>("available loot")->Get())
+                    {
+                        // GetLoot(0) lets Playerbots choose a target outside
+                        // interaction range so its normal movement action can
+                        // approach it.
+                        LootObject pendingLoot = availableLoot->GetLoot();
+                        if (!pendingLoot.IsEmpty() && targetValue)
+                            targetValue->Set(pendingLoot);
+                    }
+                    selected = ExecutePlayerbotAction(bot, "loot");
+                    target = targetValue ? targetValue->Get() : LootObject();
+                    lootStage = "selected";
+                }
+
+                if (!target.IsEmpty())
+                {
+                    ObjectGuid targetGuid = target.guid;
+                    WorldObject* lootObject = target.GetWorldObject(bot);
+                    if (!lootObject)
+                    {
+                        if (LootObjectStack* availableLoot = context->GetValue<LootObjectStack*>("available loot")->Get())
+                            availableLoot->Remove(targetGuid);
+                        if (targetValue)
+                            targetValue->Set(LootObject());
+                        lootStage = "target_invalid";
+                    }
+                    else if (bot->isMoving() || bot->GetDistance(lootObject) > INTERACTION_DISTANCE - 2.0f)
+                    {
+                        moved = ExecutePlayerbotAction(bot, "move to loot");
+                        lootStage = "approach";
+                    }
+                    else
+                    {
+                        opened = ExecutePlayerbotAction(bot, "open loot");
+                        lootStage = "open";
+                    }
                 }
             }
-            const bool selected = ExecutePlayerbotAction(bot, "loot");
-            const bool moved = ExecutePlayerbotAction(bot, "move to loot");
-            const bool opened = ExecutePlayerbotAction(bot, "open loot");
             UpdateActivityState(bot, "loot", lifecycle.reason);
             if (g_EnableOllamaBotAmigoDebug && bot)
             {
                 LOG_INFO("server.loading",
-                         "[OllamaBotAmigo] Lifecycle loot lane for {}: selected={} moved={} opened={} reason='{}'",
+                         "[OllamaBotAmigo] Lifecycle loot lane for {}: stage={} selected={} moved={} opened={} reason='{}'",
                          bot->GetName(),
+                         lootStage,
                          selected ? "yes" : "no",
                          moved ? "yes" : "no",
                          opened ? "yes" : "no",
@@ -2367,23 +2419,11 @@ request_profession format:
         snapshot.nearbyEntities = BuildNearbyEntities(bot, ai);
         AppendQuestGiverNavCandidates(bot, snapshot.nearbyEntities, snapshot.navCandidates);
         snapshot.questPois = BuildQuestPois(bot);
-        for (auto const& poi : snapshot.questPois)
-        {
-            if (!poi.isTurnIn || !poi.hasZ)
-                continue;
-            WorldPosition destination(poi.mapId, poi.pos.x, poi.pos.y, poi.pos.z);
-            if (!WorldChecks::CanReach(bot, destination))
-                continue;
-            BotSnapshot::NavCandidate candidate;
-            candidate.label = "quest_turn_in:" + std::to_string(poi.questId);
-            candidate.pos = poi.pos;
-            candidate.reachable = true;
-            candidate.hasLOS = WorldChecks::IsWithinLOS(bot, destination);
-            candidate.distance2d = Distance2d(snapshot.pos, poi.pos);
-            candidate.bearingDeg = BearingDegrees(snapshot.pos, poi.pos);
-            candidate.direction = DirectionLabelFromBearing(candidate.bearingDeg);
-            snapshot.navCandidates.push_back(std::move(candidate));
-        }
+        // Quest POIs are search hints only. Do not publish a POI's exact Z as a
+        // final navigation candidate: a static or Playerbots travel point can
+        // describe a roof or another stacked floor instead of the live giver.
+        // Once the giver is visible, the structured turn-in options below use
+        // its live position and the existing request_move_hop_npc executor.
 
         // Gear / equipment signal (planner + control context).
         snapshot.avgItemLevel = bot->GetAverageItemLevel();
@@ -2749,10 +2789,10 @@ request_profession format:
                     ControlDecisionOption option;
                     option.action = "request_move_hop";
                     option.questId = quest.questId;
-                    option.reason = "move toward the server-generated quest turn-in POI";
+                    option.reason = "search the server-generated quest turn-in area";
                     option.distance = candidate.distance2d;
                     option.local = false;
-                    option.destinationType = "quest_turn_in_poi";
+                    option.destinationType = "quest_turn_in_search_area";
                     option.navigationDirection = candidate.direction;
                     option.candidateId = "nav_" + std::to_string(bestIndex);
                     addDecisionOption(std::move(option), "move_to_turn_in_poi | " + candidate.direction +
@@ -4351,6 +4391,7 @@ INSTRUCTIONS
     };
 
     std::unordered_map<uint64, std::shared_ptr<LlmBotState>> botStates;
+
 }
 
 static std::mutex sPlannerRefreshMutex;

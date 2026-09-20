@@ -40,6 +40,10 @@ int main()
     Check(selection.at("arguments").at("nav_epoch") == 7, "movement must echo the current epoch");
     state["decision_options"].push_back(talk);
     Check(SelectControlDecision(state).at("name") == "request_talk_to_quest_giver", "local turn-in takes precedence");
+    state["decision_options"] = Json::array({
+        Json{{"action", "request_move_hop_npc"}, {"priority", 2}, {"turn_in", true}, {"arguments", {{"entry_id", 123}}}},
+        Json{{"action", "request_move_hop"}, {"priority", 2}, {"turn_in", true}, {"arguments", {{"candidate_id", "nav_24"}}}}});
+    Check(SelectControlDecision(state).at("name") == "request_move_hop_npc", "live quest giver approach must precede search movement");
     state["bot"]["in_combat"] = true;
     Check(SelectControlDecision(state).empty(), "combat must preserve its owner");
     state["bot"]["in_combat"] = false;
