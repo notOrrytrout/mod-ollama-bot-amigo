@@ -1,6 +1,8 @@
 #pragma once
 
 #include "Util/WorldPositionCompat.h"
+#include "Bot/BotMovement.h"
+#include "Bot/BotTaskProgress.h"
 
 #include <cstdint>
 #include <mutex>
@@ -25,6 +27,21 @@ enum class TravelResult
     Aborted,
 };
 
+enum class AmigoTravelPurpose
+{
+    Search,
+    LiveTarget,
+    Service,
+    Loot,
+    Manual,
+};
+
+enum class AmigoCompletionCondition
+{
+    Position,
+    LiveTarget,
+};
+
 // NOTE: Playerbots defines a class named TravelTarget in TravelMgr.
 // Keep our semantic target type in a distinct name to avoid ODR/type clashes.
 struct AmigoTravelTarget
@@ -42,22 +59,29 @@ struct AmigoTravelTarget
     uint32_t turnInQuestId = 0;
     // Stable retry key for temporary avoidance after a failed navigation hop.
     std::string retryKey;
+    AmigoTravelPurpose purpose = AmigoTravelPurpose::Search;
+    AmigoCompletionCondition completion = AmigoCompletionCondition::Position;
+    uint64_t targetGuid = 0;
 };
 
 class BotTravel
 {
 public:
+    // Shared movement entry point. This owns the movement/travel transaction.
+    bool Start(Player* bot, BotMovement* movement, AmigoTravelTarget const& target,
+               MoveReason reason, uint32_t nowMs);
     void Begin(AmigoTravelTarget const& target, uint32_t nowMs);
-    void Abort(uint32_t nowMs);
+    void Abort(uint32_t nowMs, BotMovement* movement = nullptr);
     void Clear();
 
     // Update completion/failure state. Called from the main tick.
-    void Update(Player* bot, uint32_t nowMs);
+    void Update(Player* bot, uint32_t nowMs, BotMovement* movement = nullptr);
 
     bool Active() const { return active_; }
     std::optional<AmigoTravelTarget> Current() const { return target_; }
     TravelResult LastResult() const { return lastResult_; }
     uint32_t LastChangeMs() const { return lastChangeMs_; }
+    uint8_t RecoveryAttempts() const { return progress_.Attempts(); }
 
 private:
     bool Reached(Player* bot) const;
@@ -68,6 +92,8 @@ private:
     TravelResult lastResult_ = TravelResult::None;
     uint32_t startMs_ = 0;
     uint32_t lastChangeMs_ = 0;
+    BotTaskProgress progress_;
+    BotMovement* movement_ = nullptr;
 };
 
 // Registry so controller and loop can share per-bot travel state.

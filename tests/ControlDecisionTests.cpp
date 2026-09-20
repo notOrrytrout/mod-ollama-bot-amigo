@@ -1,5 +1,6 @@
 #include "Ai/ControlDecision.h"
 #include "Bot/BotNavigationPenalty.h"
+#include "Bot/BotTaskProgress.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -17,12 +18,74 @@ void Check(bool condition, char const* message)
 
 int main()
 {
+    BotTaskProgress route;
+    Check(AmigoPointInterrupted(true, false, false, false, false, false), "moving replacement must interrupt immediately");
+    Check(AmigoPointInterrupted(true, false, false, true, true, true), "replacement at old endpoint must still interrupt");
+    Check(!AmigoPointInterrupted(true, false, true, true, true, true), "normal point completion must not interrupt");
+    Check(!AmigoPointInterrupted(true, true, false, false, false, false), "same generator speed update must retain ownership");
+    Check(AmigoOwnsPoint(true, 12, 12, true), "cancel must stop the issued point");
+    Check(!AmigoOwnsPoint(true, 12, 13, true), "cancel must preserve a newer point");
+    Check(!AmigoOwnsPoint(true, 12, 12, false), "cancel must preserve combat chase");
+    Check(AmigoSearchTakeover(true, true, 179, true, false, true, true), "active search must permit takeover");
+    Check(!AmigoSearchTakeover(true, true, 179, true, true, true, true), "combat must block takeover");
+    Check(!AmigoSearchTakeover(true, true, 179, true, false, false, true), "stale mission must block takeover");
+    Check(!AmigoSearchTakeover(true, true, 0, true, false, true, true), "unspecified quest must block takeover");
+    route.Reset(100, 0);
+    route.Observe(90, 7000);
+    Check(!route.Stalled(8000), "route progress must allow a detour");
+    route.Observe(95, 9000);
+    route.Observe(90, 14000);
+    Check(route.Stalled(15000), "oscillation must not renew the progress deadline");
+    route.Retry(120, 15000);
+    route.Observe(110, 16000);
+    route.Retry(130, 24000);
+    Check(route.Exhausted(), "progress must not replenish the recovery budget");
+    Check(!route.Stalled(24001), "failed retries must still wait before another attempt");
+
+    BotLootPending loot;
+    loot.Observe(42, BotLootPhase::Approach, 20.0f, 100);
+    Check(loot.Ready(100), "a new target must be ready");
+    loot.Issued(100);
+    loot.Observe(42, BotLootPhase::Approach, 20.0f, 101);
+    Check(!loot.Ready(101), "unchanged loot must not repeat its action");
+    loot.Issued(3100);
+    loot.Issued(6100);
+    Check(loot.Exhausted(9100), "failed actions must exhaust a bounded retry budget");
+    loot.Observe(42, BotLootPhase::Open, 0.0f, 9100);
+    Check(loot.Ready(9100) && !loot.Exhausted(9100), "range transition must allow opening");
+    loot.Issued(9100);
+    loot.Observe(43, BotLootPhase::Open, 0.0f, 9101);
+    Check(loot.Ready(9101), "a changed target must not inherit the old retry deadline");
+
+    BotLootPending detour;
+    detour.Observe(99, BotLootPhase::Approach, 10, 0);
+    detour.ObserveRoute(7, 0, 0);
+    for (uint32_t now = 10000; now <= 60000; now += 10000)
+    {
+        // Direct distance increases while the native route advances.
+        detour.Observe(99, BotLootPhase::Approach, 10 + now, now);
+        detour.ObserveRoute(7, now, now);
+        detour.Issued(now, true);
+        Check(!detour.Exhausted(now), "successful progressing detour must not expire");
+    }
+    detour.ObserveRoute(8, 0, 89000);
+    Check(detour.Exhausted(90000), "new spline without progress must not renew deadline");
+
+    BotLootPending collection;
+    Check(!collection.Collecting(0, true, 100), "unrelated spell must not acquire loot ownership");
+    collection.BeginCollection(99, 100);
+    Check(collection.Collecting(0, false, 101), "successful open must retain ownership before response");
+    Check(collection.Collecting(99, false, 200), "open loot must retain collection ownership");
+    Check(!collection.Collecting(0, false, 201), "release must end collection ownership");
+    collection.BeginCollection(99, 300);
+    Check(!collection.Collecting(0, false, 5300), "missing response must have a bounded wait");
+
     BotNavigationPenalty penalty;
-    penalty.Penalize("nav_24", 1000, 90000);
-    Check(penalty.IsPenalized("nav_24", 1001), "timed-out candidate must be penalized");
-    Check(penalty.Remaining("nav_24", 1001) == 89999, "candidate penalty must retain its duration");
-    Check(!penalty.IsPenalized("nav_25", 1001), "other candidates must remain available");
-    Check(!penalty.IsPenalized("nav_24", 91000), "candidate penalty must expire");
+    penalty.Penalize("destination:1:100:200:40", 1000, 90000);
+    Check(penalty.IsPenalized("destination:1:100:200:40", 1001), "timed-out destination must be penalized");
+    Check(penalty.Remaining("destination:1:100:200:40", 1001) == 89999, "destination penalty must retain its duration");
+    Check(!penalty.IsPenalized("destination:1:100:100:40", 1001), "other destinations must remain available");
+    Check(!penalty.IsPenalized("destination:1:100:200:40", 91000), "destination penalty must expire");
 
     Json state = {{"bot", {{"active_quests", Json::array({{{"status", "complete"}}})}}},
                   {"nav", {{"nav_epoch", 7}}}, {"decision_options", Json::array()}};

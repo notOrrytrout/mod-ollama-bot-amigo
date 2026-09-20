@@ -3,6 +3,7 @@
 #include "Bot/BotControlApi.h"
 #include "Bot/BotMovement.h"
 #include "Bot/BotTravel.h"
+#include "Bot/BotTaskProgress.h"
 #include "Util/PlayerbotsCompat.h"
 #include "Playerbots.h"
 #include "ChooseTravelTargetAction.h"
@@ -463,18 +464,23 @@ BotLifecycleAssessment AssessBotLifecycle(Player const* bot, PlayerbotAI* ai, Bo
     // available-loot value instead of asking the LLM whether it should loot.
     bool canLoot = false;
     TryReadValue(ai, "can loot", canLoot);
+    LootObject lootTarget;
+    TryReadValue(ai, "loot target", lootTarget);
     LootObjectStack* availableLoot = nullptr;
     TryReadValue(ai, "available loot", availableLoot);
     bool hasPendingLoot = availableLoot && !availableLoot->GetLoot().IsEmpty();
+    bool collectingLoot = AmigoLootPending(BotGuid(bot)).Collecting(
+        bot->GetLootGUID().GetRawValue(), bot->IsNonMeleeSpellCast(false), getMSTime());
     // `has available loot` can remain true while Playerbots is still moving
     // toward a corpse or while the corpse is no longer openable. The stack
     // and the direct can-loot value identify actionable loot more accurately.
-    if (canLoot || hasPendingLoot)
+    if (canLoot || hasPendingLoot || !lootTarget.IsEmpty() || collectingLoot)
     {
         out.lane = BotLifecycleLane::Loot;
         out.score = 700;
-        out.reason = canLoot ? "Playerbots can open current loot target"
-                             : "Playerbots has pending loot target";
+        out.reason = collectingLoot ? "Playerbots is collecting loot" :
+                     canLoot ? "Playerbots can open current loot target" :
+                     "Playerbots has pending loot target";
         return out;
     }
 

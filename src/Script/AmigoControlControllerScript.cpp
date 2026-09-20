@@ -614,7 +614,13 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
             recent->RecordMovementAttempt(std::move(attempt));
         };
 
-        if (!CanMoveNow(snapshot))
+        BotTravel* existingTravel = BotTravelRegistry::Get(guid);
+        auto existingTarget = existingTravel ? existingTravel->Current() : std::optional<AmigoTravelTarget>{};
+        bool searchTakeover = existingTravel && existingTravel->Active() && existingTarget &&
+                              actionState.action.questId != 0 &&
+                              existingTarget->purpose == AmigoTravelPurpose::Search &&
+                              existingTarget->turnInQuestId == actionState.action.questId;
+        if (!CanMoveNow(snapshot) && !(searchTakeover && !snapshot.inCombat && !snapshot.grindMode))
         {
             LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop_npc due to grind/moving/combat for {}", player->GetName());
             recordMoveHopNpc(false, "gated:cannot_move_now", false, false);
@@ -639,6 +645,16 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
 
         player->SetSelection(npc->GetGUID());
 
+        if (searchTakeover)
+        {
+            bool related = false;
+            auto relations = sObjectMgr->GetCreatureQuestInvolvedRelationBounds(npc->GetEntry());
+            for (auto it = relations.first; it != relations.second; ++it)
+                related = related || it->second == actionState.action.questId;
+            if (!related || player->GetQuestStatus(actionState.action.questId) != QUEST_STATUS_COMPLETE)
+                return;
+        }
+
         BotMovement* movement = BotMovementRegistry::Get(guid);
         BotTravel* travel = BotTravelRegistry::Get(guid);
         if (!movement)
@@ -655,9 +671,15 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         }
         if (travel->Active())
         {
-            LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop_npc: travel already active for {}", player->GetName());
-            recordMoveHopNpc(false, "gated:travel_already_active", false, false);
-            return;
+            auto current = travel->Current();
+            bool takeover = searchTakeover && current && current->purpose == AmigoTravelPurpose::Search &&
+                            current->turnInQuestId == actionState.action.questId;
+            if (!takeover)
+            {
+                LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop_npc: travel already active for {}", player->GetName());
+                recordMoveHopNpc(false, "gated:travel_already_active", false, false);
+                return;
+            }
         }
 
         WorldPosition dest(npc);
@@ -682,15 +704,6 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
             return;
         }
 
-        if (!movement->StartPathMove(player, dest, MoveReason::Travel))
-        {
-            LOG_INFO("server.loading", "[OllamaBotAmigo] move_hop_npc path start failed for {} (entry_id={})", player->GetName(), actionState.action.npcEntryId);
-            recordMoveHopNpc(false, "engine:start_path_failed", reachable, hasLOS);
-            return;
-        }
-
-        recordMoveHopNpc(true, "accepted", reachable, hasLOS);
-
         uint32 nowMs = getMSTime();
         float dist = WorldPosition(player).distance(dest);
         float capped = std::min(dist, kMaxMoveDistanceCap);
@@ -700,7 +713,18 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         AmigoTravelTarget targetSpec{travelKey.str(), dest, 2.5f, timeoutMs};
         targetSpec.missionRevision = actionState.missionRevision;
         targetSpec.turnInQuestId = actionState.action.questId;
-        travel->Begin(targetSpec, nowMs);
+        targetSpec.purpose = AmigoTravelPurpose::LiveTarget;
+        targetSpec.completion = AmigoCompletionCondition::LiveTarget;
+        targetSpec.targetGuid = npc->GetGUID().GetRawValue();
+        if (searchTakeover)
+            travel->Abort(nowMs, movement);
+        if (!travel->Start(player, movement, targetSpec, MoveReason::Travel, nowMs))
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] move_hop_npc path start failed for {} (entry_id={})", player->GetName(), actionState.action.npcEntryId);
+            recordMoveHopNpc(false, "engine:start_path_failed", reachable, hasLOS);
+            return;
+        }
+        recordMoveHopNpc(true, "accepted", reachable, hasLOS);
         return;
     }
 
@@ -870,21 +894,6 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
             // LOS is not required for travel (pathfinding can route around), but is useful signal.
             LOG_DEBUG("server.loading", "[OllamaBotAmigo] move_hop destination lacks LOS for {}", player->GetName());
         }
-        if (!movement->StartPathMove(player, dest, MoveReason::Travel))
-        {
-            LOG_INFO("server.loading", "[OllamaBotAmigo] move_hop path start failed for {}", player->GetName());
-            recordMoveHop(false, "engine:start_path_failed",
-                          actionState.action.navEpoch,
-                          actionState.action.navCandidateId,
-                          candReachable, candHasLOS, candCanMove, reachable, hasLOS);
-            return;
-        }
-
-        recordMoveHop(true, "accepted",
-                      actionState.action.navEpoch,
-                      actionState.action.navCandidateId,
-                      candReachable, candHasLOS, candCanMove, reachable, hasLOS);
-
         // Record semantic travel target (arrival radius + timeout) for downstream reporting.
         // Timeout is based on the current distance to destination, clamped to prevent indefinite wandering.
         uint32 nowMs = getMSTime();
@@ -896,8 +905,26 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         AmigoTravelTarget targetSpec{travelKey.str(), dest, 2.5f, timeoutMs};
         targetSpec.missionRevision = actionState.missionRevision;
         targetSpec.turnInQuestId = actionState.action.questId;
-        targetSpec.retryKey = actionState.action.navCandidateId;
-        travel->Begin(targetSpec, nowMs);
+        // The public candidate id is a snapshot-local selector. Penalties use
+        // the resolved destination instead, so a later snapshot cannot move a
+        // penalty to an unrelated point that happens to reuse nav_24.
+        std::ostringstream retryKey;
+        retryKey << "destination:" << dest.GetMapId() << ':'
+                 << std::llround(dest.GetPositionX() * 2.0f) << ':'
+                 << std::llround(dest.GetPositionY() * 2.0f) << ':'
+                 << std::llround(dest.GetPositionZ() * 2.0f);
+        targetSpec.retryKey = retryKey.str();
+        targetSpec.purpose = AmigoTravelPurpose::Search;
+        if (!travel->Start(player, movement, targetSpec, MoveReason::Travel, nowMs))
+        {
+            LOG_INFO("server.loading", "[OllamaBotAmigo] move_hop path start failed for {}", player->GetName());
+            recordMoveHop(false, "engine:start_path_failed",
+                          actionState.action.navEpoch, actionState.action.navCandidateId,
+                          candReachable, candHasLOS, candCanMove, reachable, hasLOS);
+            return;
+        }
+        recordMoveHop(true, "accepted", actionState.action.navEpoch, actionState.action.navCandidateId,
+                      candReachable, candHasLOS, candCanMove, reachable, hasLOS);
         return;
     }
 

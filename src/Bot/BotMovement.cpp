@@ -1,7 +1,9 @@
 #include "Bot/BotMovement.h"
+#include "Bot/BotTaskProgress.h"
 
 #include "Log.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
 #include "PathGenerator.h"
 #include "Player.h"
 #include "Timer.h"
@@ -22,58 +24,11 @@ namespace
     // Consider destination reached when within this radius (2D).
     constexpr float kReachedEpsilon = 1.0f;
 
-    // Movement stepping tunables:
-    // - kMinAdvanceDist ensures we don't pick micro-waypoints when the path is dense.
-    // - kMaxTurnAngleDeg prevents skipping around corners (which can cut into obstacles).
-    constexpr float kMinAdvanceDist = 6.0f;       // yards
-    constexpr float kMaxAdvanceDistFloor = 10.0f; // yards
-    constexpr float kMaxAdvanceDistCeil = 24.0f;  // yards
-    constexpr float kMaxTurnAngleDeg = 30.0f;     // degrees
-    constexpr float kSkipClosePointEps = 0.8f;    // yards
-
     float Dist2D(float ax, float ay, float bx, float by)
     {
         float dx = ax - bx;
         float dy = ay - by;
         return std::sqrt(dx * dx + dy * dy);
-    }
-
-    float ClampDot(float v)
-    {
-        if (v < -1.0f)
-            return -1.0f;
-        if (v > 1.0f)
-            return 1.0f;
-        return v;
-    }
-
-float Clamp(float v, float lo, float hi)
-{
-    if (v < lo)
-        return lo;
-    if (v > hi)
-        return hi;
-    return v;
-}
-
-    float AngleBetween(G3D::Vector3 const& a, G3D::Vector3 const& b)
-    {
-        float la = a.length();
-        float lb = b.length();
-        if (la <= 1e-4f || lb <= 1e-4f)
-            return 0.0f;
-
-        float dot = ClampDot(a.dot(b) / (la * lb));
-        return std::acos(dot); // radians
-    }
-
-    float ComputeMaxAdvanceDist(Player* bot)
-    {
-        // Aim for ~2.25s worth of travel per step, clamped.
-        // `GetSpeed(MOVE_RUN)` is in yards/sec on TrinityCore.
-        float speed = bot ? bot->GetSpeed(MOVE_RUN) : 7.0f;
-        float dist = speed * 2.25f;
-        return Clamp(dist, kMaxAdvanceDistFloor, kMaxAdvanceDistCeil);
     }
 
     struct RegistryState
@@ -110,6 +65,7 @@ bool BotMovement::StartPathMove(Player* bot, WorldPosition const& dest, MoveReas
 
     bot_ = bot;
     reason_ = reason;
+    interrupted_ = false;
 
     // Playerbots WorldPosition accessors are not const-correct.
     // Make a local copy before calling getMapId().
@@ -138,6 +94,30 @@ void BotMovement::Update(uint32 diff)
 
     lastMoveElapsedMs_ += diff;
 
+    if (issuedPoint_)
+    {
+        float dx = bot_->GetPositionX() - issuedX_;
+        float dy = bot_->GetPositionY() - issuedY_;
+        float dz = bot_->GetPositionZ() - issuedZ_;
+        bool reachedPoint = std::sqrt(dx * dx + dy * dy + dz * dz) <= 0.8f;
+        auto* motion = bot_->GetMotionMaster();
+        bool sameGenerator = motion->top() == issuedGenerator_;
+        if (AmigoPointInterrupted(true, sameGenerator, bot_->movespline->GetId() == splineId_,
+            bot_->movespline->Finalized(), reachedPoint,
+            motion->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE))
+        {
+            interrupted_ = true;
+            // Relinquish ownership before cancellation; preserve the replacement.
+            issuedPoint_ = false;
+            Abort(reason_);
+            return;
+        }
+        if (sameGenerator)
+            splineId_ = bot_->movespline->GetId();
+        if (!sameGenerator && reachedPoint)
+            issuedPoint_ = false;
+    }
+
     if (ShouldAbort())
     {
         Abort(reason_);
@@ -158,7 +138,7 @@ void BotMovement::Update(uint32 diff)
     if (lastMoveElapsedMs_ < kMinMovePointIntervalMs)
         return;
 
-    Advance(ComputeMaxAdvanceDist(bot_));
+    Advance();
     lastMoveElapsedMs_ = 0;
 }
 
@@ -171,10 +151,22 @@ void BotMovement::Abort(MoveReason /*reason*/)
         return;
     }
 
-    // We do not call Movement generators here; we only stop our own stepping.
-    // MotionMaster may continue existing movement (combat, follow, etc.).
+    if (AmigoOwnsPoint(issuedPoint_, splineId_, bot_->movespline->GetId(),
+        bot_->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE))
+    {
+        bot_->StopMoving();
+        bot_->GetMotionMaster()->MovementExpired();
+    }
+    issuedPoint_ = false;
     active_ = false;
     path_.clear();
+}
+
+bool BotMovement::ConsumeInterruption()
+{
+    bool interrupted = interrupted_;
+    interrupted_ = false;
+    return interrupted;
 }
 
 bool BotMovement::BuildPath(WorldPosition const& dest)
@@ -199,70 +191,45 @@ bool BotMovement::BuildPath(WorldPosition const& dest)
                                destCopy.GetPositionZ()))
         return false;
 
+    if (pathGen.GetPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE | PATHFIND_SHORTCUT))
+        return false;
     path_ = pathGen.GetPath();
-    return !path_.empty();
+    if (path_.empty())
+        return false;
+    G3D::Vector3 end(destX_, destY_, destZ_);
+    return (path_.back() - end).length() <= 1.5f;
 }
 
-void BotMovement::Advance(float maxDist)
+float BotMovement::RemainingRoute() const
 {
-    if (!bot_)
-        return;
+    if (!bot_ || path_.empty())
+        return 0.0f;
+    G3D::Vector3 previous(bot_->GetPositionX(), bot_->GetPositionY(), bot_->GetPositionZ());
+    float remaining = 0.0f;
+    for (auto const& point : path_)
+    {
+        remaining += (point - previous).length();
+        previous = point;
+    }
+    return remaining;
+}
 
+void BotMovement::Advance()
+{
+    G3D::Vector3 current(bot_->GetPositionX(), bot_->GetPositionY(), bot_->GetPositionZ());
+    while (!path_.empty() && (path_.front() - current).length() <= 0.5f)
+        path_.erase(path_.begin());
     if (path_.empty())
-    {
-        active_ = false;
         return;
-    }
-
-    // Choose a farther waypoint along the path, without skipping around corners.
-    // NOTE: We still call MovePoint (straight-line) to the chosen waypoint,
-    // so we avoid selecting a point past a significant turn.
-    const G3D::Vector3 cur(bot_->GetPositionX(), bot_->GetPositionY(), bot_->GetPositionZ());
-
-    float traveled = 0.0f;
-    size_t targetIdx = 0;
-
-    const float maxTurnRad = kMaxTurnAngleDeg * 3.14159265f / 180.0f;
-
-    for (size_t i = 0; i < path_.size(); ++i)
-    {
-        const G3D::Vector3 prev = (i == 0) ? cur : path_[i - 1];
-        const G3D::Vector3 here = path_[i];
-
-        float seg = (here - prev).length();
-        if (seg < kSkipClosePointEps)
-        {
-            // Dense path point; treat as consumed for targeting.
-            targetIdx = i;
-            continue;
-        }
-
-        // If taking this segment would exceed maxDist, stop once we have a reasonable step.
-        if ((traveled + seg) > maxDist && traveled >= kMinAdvanceDist)
-            break;
-
-        traveled += seg;
-        targetIdx = i;
-
-        // Stop at corners once we have moved a bit.
-        if (i + 1 < path_.size() && traveled >= kMinAdvanceDist)
-        {
-            const G3D::Vector3 next = path_[i + 1];
-            const G3D::Vector3 v1 = here - prev;
-            const G3D::Vector3 v2 = next - here;
-            if (AngleBetween(v1, v2) > maxTurnRad)
-                break;
-        }
-
-        if (traveled >= maxDist)
-            break;
-    }
-
-    const auto target = path_[targetIdx];
-    // Consume waypoints up to and including the target (we will walk straight to it).
-    path_.erase(path_.begin(), path_.begin() + targetIdx + 1);
-
+    // Keep each pathfinder corner until reached. Issuing a point is not progress.
+    auto const& target = path_.front();
     bot_->GetMotionMaster()->MovePoint(0, target.x, target.y, target.z);
+    splineId_ = bot_->movespline->GetId();
+    issuedGenerator_ = bot_->GetMotionMaster()->top();
+    issuedX_ = target.x;
+    issuedY_ = target.y;
+    issuedZ_ = target.z;
+    issuedPoint_ = true;
 }
 
 bool BotMovement::ShouldAbort() const
@@ -282,11 +249,13 @@ bool BotMovement::ReachedDestination() const
     if (!bot_)
         return true;
 
-    // If we've consumed the path, consider it reached once close in 2D.
+    // If we've consumed the path, require the correct floor as well as the
+    // horizontal arrival radius. A wrong-floor endpoint must not complete.
     if (path_.empty())
     {
         float d2 = Dist2D(bot_->GetPositionX(), bot_->GetPositionY(), destX_, destY_);
-        return d2 <= kReachedEpsilon;
+        float dz = std::fabs(bot_->GetPositionZ() - destZ_);
+        return d2 <= kReachedEpsilon && dz <= 1.5f;
     }
 
     return false;

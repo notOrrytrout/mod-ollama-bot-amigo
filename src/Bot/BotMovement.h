@@ -8,6 +8,7 @@
 #include <vector>
 
 class Player;
+class MovementGenerator;
 class WorldPosition;
 
 enum class MoveReason
@@ -35,11 +36,13 @@ public:
     // Stops any active movement, regardless of the abort reason.
     void Abort(MoveReason reason);
 
+    float RemainingRoute() const;
     bool IsMoving() const { return active_; }
+    bool ConsumeInterruption();
 
 private:
     bool BuildPath(WorldPosition const& dest);
-    void Advance(float maxDist);
+    void Advance();
     bool ShouldAbort() const;
     bool ReachedDestination() const;
 
@@ -48,6 +51,13 @@ private:
     Movement::PointsArray path_;
     MoveReason reason_ = MoveReason::Travel;
 
+    bool issuedPoint_ = false;
+    MovementGenerator* issuedGenerator_ = nullptr;
+    bool interrupted_ = false;
+    uint32 splineId_ = 0;
+    float issuedX_ = 0.0f;
+    float issuedY_ = 0.0f;
+    float issuedZ_ = 0.0f;
     bool active_ = false;
     uint32 lastMoveElapsedMs_ = 0;
 

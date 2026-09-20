@@ -542,12 +542,6 @@ bool HandleBotControlCommand(Player* bot, BotControlCommand const& command)
         LOG_INFO("server.loading", "[OllamaBotAmigo] Move hop rejected (reason=unreachable) for {}", bot->GetName());
         return false;
     }
-    if (!movement->StartPathMove(bot, dest, MoveReason::Travel))
-    {
-        LOG_INFO("server.loading", "[OllamaBotAmigo] Move hop path start failed for {}", bot->GetName());
-        return false;
-    }
-
     // Record semantic completion target.
     uint32 nowMs = getMSTime();
     uint32 timeoutMs = static_cast<uint32>(std::clamp(command.distance * 1800.0f, 30000.0f, 180000.0f));
@@ -557,7 +551,12 @@ bool HandleBotControlCommand(Player* bot, BotControlCommand const& command)
     else
         key = "api:" + key;
     AmigoTravelTarget targetSpec{key, dest, 2.5f, timeoutMs};
-    travel->Begin(targetSpec, nowMs);
+    targetSpec.purpose = AmigoTravelPurpose::Manual;
+    if (!travel->Start(bot, movement, targetSpec, MoveReason::Travel, nowMs))
+    {
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Move hop path start failed for {}", bot->GetName());
+        return false;
+    }
 
     if (g_EnableOllamaBotAmigoDebug)
     {

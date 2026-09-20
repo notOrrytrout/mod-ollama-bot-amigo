@@ -33,7 +33,9 @@
 #include "Bot/BotNeeds.h"
 #include "Bot/BotLifecycle.h"
 #include "Bot/BotNavigationPenalty.h"
+#include "Bot/BotTaskProgress.h"
 #include "LootObjectStack.h"
+#include "MoveSpline.h"
 #include "Script/OllamaBotPlannerRefresh.h"
 #include <array>
 #include <algorithm>
@@ -82,12 +84,6 @@ namespace
     constexpr uint32 kPostEnterGrindControlDelayMs = 10000; // 10 seconds
     constexpr uint32 kNavigationTimeoutPenaltyMs = 90000;   // 90 seconds
 
-    struct LootLifecycleRuntime
-    {
-        uint32 lastActionMs = 0;
-    };
-
-    std::unordered_map<uint64, LootLifecycleRuntime> lootLifecycle;
     constexpr float kQuestGiverApproachOffsetMeters = 1.8f;
     struct DistanceBand
     {
@@ -792,78 +788,56 @@ namespace
 
         if (lifecycle.lane == BotLifecycleLane::Loot)
         {
-            // Drive Playerbots' existing loot actions as a small state machine.
-            // Do not select, move, and open in one tick. Playerbots owns the
-            // actual loot rules; Amigo only chooses the next valid stage.
-            constexpr uint32 kLootRetryIntervalMs = 1000;
-            uint64 guid = bot->GetGUID().GetRawValue();
-            LootLifecycleRuntime& lootState = lootLifecycle[guid];
             uint32 nowMs = getMSTime();
-            if (lootState.lastActionMs != 0 && nowMs - lootState.lastActionMs < kLootRetryIntervalMs)
+            auto& pending = AmigoLootPending(bot->GetGUID().GetRawValue());
+            auto* context = ai->GetAiObjectContext();
+            if (!context)
                 return true;
-            lootState.lastActionMs = nowMs;
-
-            bool selected = false;
-            bool moved = false;
-            bool opened = false;
-            std::string lootStage = "no_target";
-            if (AiObjectContext* context = ai->GetAiObjectContext())
+            auto* value = context->GetValue<LootObject>("loot target");
+            auto* stackValue = context->GetValue<LootObjectStack*>("available loot");
+            auto* stack = stackValue ? stackValue->Get() : nullptr;
+            if (!value || !stack)
+                return true;
+            LootObject target = value->Get();
+            // Packet-driven Playerbots actions own collection and release.
+            if (pending.Collecting(bot->GetLootGUID().GetRawValue(), bot->IsNonMeleeSpellCast(false), nowMs))
+                return true;
+            WorldObject* object = target.IsEmpty() ? nullptr : target.GetWorldObject(bot);
+            BotLootPhase phase = target.IsEmpty() ? BotLootPhase::Select :
+                object && bot->GetDistance(object) <= INTERACTION_DISTANCE - 2.0f
+                    ? BotLootPhase::Open : BotLootPhase::Approach;
+            LootObject candidate = target.IsEmpty() ? stack->GetLoot(sPlayerbotAIConfig.lootDistance) : target;
+            float remaining = object ? bot->GetDistance(object) : 0.0f;
+            pending.Observe(candidate.guid.GetRawValue(), phase, remaining, nowMs);
+            if (phase == BotLootPhase::Approach && bot->movespline->Initialized())
+                pending.ObserveRoute(bot->movespline->GetId(), bot->movespline->timePassed(), nowMs);
+            if (!target.IsEmpty() && (!object || !target.IsLootPossible(bot) || pending.Exhausted(nowMs)))
             {
-                Value<LootObject>* targetValue = context->GetValue<LootObject>("loot target");
-                LootObject target = targetValue ? targetValue->Get() : LootObject();
-
-                if (target.IsEmpty())
-                {
-                    if (LootObjectStack* availableLoot = context->GetValue<LootObjectStack*>("available loot")->Get())
-                    {
-                        // GetLoot(0) lets Playerbots choose a target outside
-                        // interaction range so its normal movement action can
-                        // approach it.
-                        LootObject pendingLoot = availableLoot->GetLoot();
-                        if (!pendingLoot.IsEmpty() && targetValue)
-                            targetValue->Set(pendingLoot);
-                    }
-                    selected = ExecutePlayerbotAction(bot, "loot");
-                    target = targetValue ? targetValue->Get() : LootObject();
-                    lootStage = "selected";
-                }
-
-                if (!target.IsEmpty())
-                {
-                    ObjectGuid targetGuid = target.guid;
-                    WorldObject* lootObject = target.GetWorldObject(bot);
-                    if (!lootObject)
-                    {
-                        if (LootObjectStack* availableLoot = context->GetValue<LootObjectStack*>("available loot")->Get())
-                            availableLoot->Remove(targetGuid);
-                        if (targetValue)
-                            targetValue->Set(LootObject());
-                        lootStage = "target_invalid";
-                    }
-                    else if (bot->isMoving() || bot->GetDistance(lootObject) > INTERACTION_DISTANCE - 2.0f)
-                    {
-                        moved = ExecutePlayerbotAction(bot, "move to loot");
-                        lootStage = "approach";
-                    }
-                    else
-                    {
-                        opened = ExecutePlayerbotAction(bot, "open loot");
-                        lootStage = "open";
-                    }
-                }
+                stack->Remove(target.guid);
+                value->Set(LootObject());
+                pending = BotLootPending{};
+                return true;
             }
+            if (!pending.Ready(nowMs) || (phase == BotLootPhase::Approach && bot->isMoving()))
+                return true;
+            if (phase == BotLootPhase::Open && bot->isMoving())
+            {
+                bot->StopMoving();
+                return true;
+            }
+            if (pending.Exhausted(nowMs))
+            {
+                if (!candidate.IsEmpty())
+                    stack->Remove(candidate.guid);
+                pending = BotLootPending{};
+                return true;
+            }
+            bool succeeded = ExecutePlayerbotAction(bot, phase == BotLootPhase::Select ? "loot" :
+                phase == BotLootPhase::Approach ? "move to loot" : "open loot");
+            pending.Issued(nowMs, succeeded);
+            if (succeeded && phase == BotLootPhase::Open)
+                pending.BeginCollection(target.guid.GetRawValue(), nowMs);
             UpdateActivityState(bot, "loot", lifecycle.reason);
-            if (g_EnableOllamaBotAmigoDebug && bot)
-            {
-                LOG_INFO("server.loading",
-                         "[OllamaBotAmigo] Lifecycle loot lane for {}: stage={} selected={} moved={} opened={} reason='{}'",
-                         bot->GetName(),
-                         lootStage,
-                         selected ? "yes" : "no",
-                         moved ? "yes" : "no",
-                         opened ? "yes" : "no",
-                         lifecycle.reason);
-            }
             return true;
         }
 
@@ -2383,7 +2357,7 @@ request_profession format:
         }
     }
 
-    BotSnapshot BuildBotSnapshot(Player *bot, PlayerbotAI *ai)
+    BotSnapshot BuildBotSnapshot(Player *bot, PlayerbotAI *ai, BotNavigationPenalty const& penalty, uint32 nowMs)
     {
         // Gather bot state needed for planning and control.
         BotSnapshot snapshot;
@@ -2702,6 +2676,24 @@ request_profession format:
 
                 snapshot.activeQuests.push_back(std::move(progress));
             }
+        }
+
+        for (size_t i = 0; i < snapshot.navCandidates.size(); ++i)
+        {
+            auto& candidate = snapshot.navCandidates[i];
+            std::ostringstream destinationKey;
+            destinationKey << "destination:" << snapshot.mapId << ':'
+                           << std::llround(candidate.pos.x * 2.0f) << ':'
+                           << std::llround(candidate.pos.y * 2.0f) << ':'
+                           << std::llround(candidate.pos.z * 2.0f);
+            std::string candidateId = destinationKey.str();
+            uint32 penaltyRemaining = penalty.Remaining(candidateId, nowMs);
+            if (penaltyRemaining == 0)
+                continue;
+
+            candidate.temporarilyBlocked = true;
+            candidate.penaltyRemainingMs = penaltyRemaining;
+            candidate.canMove = false;
         }
 
         // Build one structured set of legal choices for every mission type.
@@ -4535,9 +4527,43 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             state.configuredMissionSignature = configuredSignature;
         }
 
+        // Search hints can become a live target while the decision selector is
+        // intentionally idle. Validate the involved quest relation on this thread.
+        if (auto current = state.travel.Current(); current && AmigoSearchTakeover(
+            state.travel.Active(), current->purpose == AmigoTravelPurpose::Search,
+            current->turnInQuestId, bot->IsAlive(), bot->IsInCombat(),
+            BotMissionRegistry::Instance().RevisionMatches(guid, current->missionRevision),
+            bot->GetQuestStatus(current->turnInQuestId) == QUEST_STATUS_COMPLETE))
+        {
+            auto* context = ai->GetAiObjectContext();
+            if (context)
+            {
+                for (ObjectGuid npcGuid : context->GetValue<GuidVector>("nearest npcs")->Get())
+                {
+                    Creature* npc = ai->GetCreature(npcGuid);
+                    if (!npc || !npc->IsAlive() || !npc->IsQuestGiver() || npc->IsHostileTo(bot))
+                        continue;
+                    auto relations = sObjectMgr->GetCreatureQuestInvolvedRelationBounds(npc->GetEntry());
+                    bool matches = false;
+                    for (auto it = relations.first; it != relations.second; ++it)
+                        matches = matches || it->second == current->turnInQuestId;
+                    if (!matches || !WorldChecks::CanReach(bot, WorldPosition(npc)))
+                        continue;
+                    auto replacement = *current;
+                    replacement.dest = WorldPosition(npc);
+                    replacement.targetGuid = npcGuid.GetRawValue();
+                    replacement.purpose = AmigoTravelPurpose::LiveTarget;
+                    replacement.completion = AmigoCompletionCondition::LiveTarget;
+                    state.travel.Abort(nowMs, &state.movement);
+                    state.travel.Start(bot, &state.movement, replacement, MoveReason::Travel, nowMs);
+                    break;
+                }
+            }
+        }
+
         // Tick movement first; travel completion is checked every tick.
         state.movement.Update(diff);
-        state.travel.Update(bot, nowMs);
+        state.travel.Update(bot, nowMs, &state.movement);
 
         if (g_OllamaBotControlClearGoalsOnConfigLoad)
         {
@@ -4825,26 +4851,9 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
         {
             continue;
         }
-        BotSnapshot snapshot = BuildBotSnapshot(bot, ai);
-        snapshot.nowMs = nowMs;
-
-        // A timed-out hop must not be immediately selected again when the
-        // navigation epoch changes. Candidate IDs are stable for the generated
-        // directional set, so the penalty follows the same candidate across
-        // snapshots while other directions remain available.
         state.navigationPenalty.Prune(nowMs);
-        for (size_t i = 0; i < snapshot.navCandidates.size(); ++i)
-        {
-            auto& candidate = snapshot.navCandidates[i];
-            std::string candidateId = "nav_" + std::to_string(i);
-            uint32 penaltyRemaining = state.navigationPenalty.Remaining(candidateId, nowMs);
-            if (penaltyRemaining == 0)
-                continue;
-
-            candidate.temporarilyBlocked = true;
-            candidate.penaltyRemainingMs = penaltyRemaining;
-            candidate.canMove = false;
-        }
+        BotSnapshot snapshot = BuildBotSnapshot(bot, ai, state.navigationPenalty, nowMs);
+        snapshot.nowMs = nowMs;
 
         // Publish internal navigation candidates for controller resolution (not serialized to the LLM).
         {

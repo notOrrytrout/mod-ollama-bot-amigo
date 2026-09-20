@@ -1,5 +1,8 @@
 #include "Util/WorldChecks.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace WorldChecks
 {
     bool IsWithinLOS(Player* bot, WorldObject* obj)
@@ -67,6 +70,8 @@ namespace WorldChecks
             return false;
 
         Movement::PointsArray const& pts = pathGen.GetPath();
+        if (pathGen.GetPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE | PATHFIND_SHORTCUT))
+            return false;
         if (pts.empty())
             return false;
 
@@ -74,8 +79,11 @@ namespace WorldChecks
         float dx = last.x - posCopy.GetPositionX();
         float dy = last.y - posCopy.GetPositionY();
         float dist2d = std::sqrt(dx * dx + dy * dy);
+        float distz = std::fabs(last.z - posCopy.GetPositionZ());
 
         // If the path ends close enough to the destination, treat it as reachable.
-        return dist2d <= std::max(0.5f, tolerance);
+        // A point on another floor can be close in 2D. The path endpoint must
+        // also agree with the requested height before it is usable.
+        return dist2d <= std::max(0.5f, tolerance) && distz <= std::max(1.0f, tolerance);
     }
 }
