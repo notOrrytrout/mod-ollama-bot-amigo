@@ -1,5 +1,6 @@
 #include "Script/OllamaBotControlLoop.h"
 #include "Script/AmigoControlControllerScript.h"
+#include "Script/AmigoPlanner.h"
 #include "Ai/ControlAction.h"
 #include "Ai/ControlContract.h"
 #include "Ai/BotMindState.h"
@@ -219,6 +220,8 @@ namespace
             std::string label;
             Position3 pos;
             std::vector<uint32> questIds;
+            uint32 questObjectQuestId = 0;
+            uint32 questObjectEntryId = 0;
             bool canMove = false;
             // Engine-derived feasibility signals.
             bool hasLOS = false;
@@ -663,9 +666,15 @@ namespace
             reason = "targeted_attack_requires_named_grind";
             return false;
         }
-        if (capability == ControlAction::Capability::GatherTarget && mission.kind != BotMissionKind::Gather)
+        if (capability == ControlAction::Capability::GatherTarget &&
+            mission.kind != BotMissionKind::Gather && mission.kind != BotMissionKind::Quest)
         {
             reason = "targeted_gather_requires_named_gather";
+            return false;
+        }
+        if (capability == ControlAction::Capability::UseQuestObject && mission.kind != BotMissionKind::Quest)
+        {
+            reason = "quest_object_requires_quest_mission";
             return false;
         }
         switch (mission.kind)
@@ -1631,6 +1640,8 @@ request_profession format:
             return "enter_attack_pull";
         case ControlAction::Capability::GatherTarget:
             return "gather_target";
+        case ControlAction::Capability::UseQuestObject:
+            return "use_quest_object";
         case ControlAction::Capability::Stay:
             return "stay";
         case ControlAction::Capability::Unstay:
@@ -2131,7 +2142,7 @@ request_profession format:
         for (ObjectGuid const &guid : gos)
         {
             GameObject *gameObject = ai->GetGameObject(guid);
-            if (!gameObject)
+            if (!gameObject || !gameObject->isSpawned())
             {
                 continue;
             }
@@ -2725,6 +2736,49 @@ request_profession format:
             }
         }
 
+        // Add a ground-checked approach point for visible quest objects. Static
+        // POIs remain a search hint when the object is not visible yet.
+        for (auto const& quest : snapshot.activeQuests)
+        {
+            if (quest.status != QUEST_STATUS_INCOMPLETE)
+                continue;
+            for (auto const& objective : quest.objectives)
+            {
+                if (objective.type != "game_object" || objective.current >= objective.required || objective.targetId >= 0)
+                    continue;
+                uint32 entryId = static_cast<uint32>(-objective.targetId);
+                for (auto const& entity : snapshot.nearbyEntities)
+                {
+                    if (entity.type != "game_object" || entity.entryId != entryId)
+                        continue;
+                    float distance = Distance2d(snapshot.pos, entity.pos);
+                    if (distance <= INTERACTION_DISTANCE - 1.0f)
+                        continue;
+                    float step = std::min(distance - (INTERACTION_DISTANCE - 1.0f),
+                        std::max(1.0f, g_OllamaBotControlNavMaxDistance));
+                    float x = snapshot.pos.x + (entity.pos.x - snapshot.pos.x) * step / distance;
+                    float y = snapshot.pos.y + (entity.pos.y - snapshot.pos.y) * step / distance;
+                    float z = snapshot.pos.z;
+                    if (!WorldChecks::ResolveGroundZ(bot, x, y, snapshot.pos.z, z))
+                        continue;
+                    WorldPosition position(bot->GetMapId(), x, y, z);
+                    BotSnapshot::NavCandidate candidate;
+                    candidate.label = "quest_object";
+                    candidate.pos = {x, y, z};
+                    candidate.questObjectQuestId = quest.questId;
+                    candidate.questObjectEntryId = entryId;
+                    candidate.hasLOS = WorldChecks::IsWithinLOS(bot, position);
+                    candidate.reachable = WorldChecks::IsSafeGroundDestination(bot, position) &&
+                        WorldChecks::CanReach(bot, position);
+                    candidate.canMove = canMove && candidate.reachable;
+                    candidate.distance2d = step;
+                    candidate.bearingDeg = BearingDegrees(snapshot.pos, candidate.pos);
+                    candidate.direction = DirectionLabelFromBearing(candidate.bearingDeg);
+                    snapshot.navCandidates.push_back(std::move(candidate));
+                }
+            }
+        }
+
         for (size_t i = 0; i < snapshot.navCandidates.size(); ++i)
         {
             auto& candidate = snapshot.navCandidates[i];
@@ -2865,11 +2919,50 @@ request_profession format:
                 for (auto const &objective : quest.objectives)
                 {
                     if (objective.current >= objective.required ||
-                        (objective.type != "item" && objective.targetName.empty()))
+                        (objective.type == "creature" && objective.targetName.empty()))
                         continue;
 
                     for (auto const &entity : snapshot.nearbyEntities)
                     {
+                        if (objective.type == "game_object" && entity.type == "game_object" &&
+                            objective.targetId == -static_cast<int32>(entity.entryId))
+                        {
+                            if (entity.distance <= INTERACTION_DISTANCE &&
+                                bot->IsWithinLOS(entity.pos.x, entity.pos.y, entity.pos.z))
+                            {
+                                ControlDecisionOption option;
+                                option.action = "request_use_quest_object";
+                                option.questId = quest.questId;
+                                option.entryId = entity.entryId;
+                                option.targetName = entity.name;
+                                option.reason = "use the required quest object in range";
+                                option.objectiveType = objective.type;
+                                option.objectiveTargetId = objective.targetId;
+                                addDecisionOption(std::move(option), "use_quest_object:" + entity.name);
+                            }
+                            else
+                            {
+                                for (size_t index = 0; index < snapshot.navCandidates.size(); ++index)
+                                {
+                                    auto const& candidate = snapshot.navCandidates[index];
+                                    if (candidate.questObjectQuestId != quest.questId ||
+                                        candidate.questObjectEntryId != entity.entryId || !candidate.canMove ||
+                                        candidate.temporarilyBlocked)
+                                        continue;
+                                    ControlDecisionOption option;
+                                    option.action = "request_move_hop";
+                                    option.questId = quest.questId;
+                                    option.candidateId = "nav_" + std::to_string(index);
+                                    option.destinationType = "quest_object";
+                                    option.objectiveType = objective.type;
+                                    option.objectiveTargetId = objective.targetId;
+                                    option.reason = "approach the required quest object";
+                                    addDecisionOption(std::move(option), "move_to_quest_object:" + entity.name);
+                                    break;
+                                }
+                            }
+                            break;
+                        }
                         bool itemSource = objective.type == "item" && AmigoDropsQuestItem(
                             entity.type == "npc" ? static_cast<int32>(entity.entryId) :
                                 -static_cast<int32>(entity.entryId), static_cast<uint32>(objective.targetId));
@@ -2913,7 +3006,8 @@ request_profession format:
                         break;
                     }
 
-                    if ((objective.type != "creature" && objective.type != "item") || objective.objectiveIndex < 0)
+                    if ((objective.type != "creature" && objective.type != "item" &&
+                         objective.type != "game_object") || objective.objectiveIndex < 0)
                         continue;
 
                     // Move one server-approved hop toward the quest objective
@@ -4272,7 +4366,7 @@ INSTRUCTIONS
         return false;
     }
 
-    bool HasRemainingMissionObjective(BotSnapshot const& snapshot)
+    bool HasRemainingMissionObjective(BotSnapshot const& snapshot, uint32 targetEntryId = 0)
     {
         for (auto const& quest : snapshot.activeQuests)
             if (quest.status == QUEST_STATUS_COMPLETE)
@@ -4284,8 +4378,13 @@ INSTRUCTIONS
                 return false;
             for (auto const& objective : quest.objectives)
             {
-                if (objective.type != "creature" ||
-                    (snapshot.mission.kind != BotMissionKind::Quest && objective.targetName != snapshot.mission.target))
+                bool creatureObjective = objective.type == "creature" &&
+                    (snapshot.mission.kind == BotMissionKind::Quest ||
+                     objective.targetName == snapshot.mission.target);
+                bool itemSource = snapshot.mission.kind == BotMissionKind::Quest && targetEntryId &&
+                    objective.type == "item" && objective.targetId > 0 &&
+                    AmigoDropsQuestItem(static_cast<int32>(targetEntryId), static_cast<uint32>(objective.targetId));
+                if (!creatureObjective && !itemSource)
                     continue;
 
                 foundMatchingObjective = true;
@@ -4499,6 +4598,8 @@ INSTRUCTIONS
         std::atomic<bool> strategicBusy{false};
         std::atomic<bool> controlBusy{false};
         std::atomic<bool> promptInFlight{false};
+        std::mutex sessionMutex;
+        bool retired = false;
         // Control planner (Ollama) backpressure.
         // These are atomic because the control request runs in a detached thread.
         std::atomic<ControlState> controlState{ControlState::Idle};
@@ -4557,6 +4658,46 @@ INSTRUCTIONS
 
 static std::mutex sPlannerRefreshMutex;
 static std::unordered_map<uint64, uint32> sPendingLongTermPlannerRefreshMs;
+
+void RetireAmigoBotState(Player* player)
+{
+    if (!player)
+        return;
+    uint64 guid = player->GetGUID().GetRawValue();
+    auto it = botStates.find(guid);
+    if (it == botStates.end())
+        return;
+
+    auto state = it->second;
+    std::lock_guard<std::mutex> sessionLock(state->sessionMutex);
+    state->retired = true;
+    state->travel.Clear();
+    state->movement.Abort(MoveReason::Travel);
+    state->profession.Abort(player, sPlayerbotsMgr.GetPlayerbotAI(player), getMSTime());
+    state->memory.FlushPending();
+    ControlActionRegistry::Instance().Clear(guid);
+    AmigoPlannerRegistry::Instance().Clear(guid);
+    ClearAmigoPendingControl(guid);
+    {
+        std::lock_guard<std::mutex> lock(GetBotLLMContextMutex());
+        GetBotLLMContext().erase(guid);
+    }
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex);
+        pendingStrategicUpdates.erase(guid);
+    }
+    {
+        std::lock_guard<std::mutex> lock(sPlannerRefreshMutex);
+        sPendingLongTermPlannerRefreshMs.erase(guid);
+    }
+    ResetBotLifecycle(player);
+    BotMovementRegistry::Unregister(guid);
+    BotTravelRegistry::Unregister(guid);
+    BotMemoryRegistry::Unregister(guid);
+    BotProfessionRegistry::Unregister(guid);
+    BotRecentHistoryRegistry::Unregister(guid);
+    botStates.erase(it);
+}
 
 static uint32 ConsumeLongTermPlannerRefresh(uint64 guid)
 {
@@ -5433,7 +5574,8 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                             }
 
                             stateRef->loggedStrategicParseError.store(false);
-                            if (BotMissionRegistry::Instance().RevisionMatches(guid, update.missionRevision) &&
+                            std::lock_guard<std::mutex> sessionLock(stateRef->sessionMutex);
+                            if (!stateRef->retired && BotMissionRegistry::Instance().RevisionMatches(guid, update.missionRevision) &&
                                 GetBotLifecycleGeneration(guid) == update.lifecycleGeneration)
                             {
                                 EnqueueStrategicUpdate(guid, std::move(update));
@@ -5695,7 +5837,9 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 }
                 bool explicitMock = IsAmigoLlmMockEnabled() && GetAmigoLlmMockControlTool() != "auto";
                 if (!optionMatched && (!explicitMock || definition.capability == ControlAction::Capability::EnterAttackPull ||
-                    definition.capability == ControlAction::Capability::EnterGrind))
+                    definition.capability == ControlAction::Capability::EnterGrind ||
+                    definition.capability == ControlAction::Capability::UseQuestObject ||
+                    definition.capability == ControlAction::Capability::GatherTarget))
                 {
                     LogControlToolRejected(toolCall.name, "action_not_in_server_options");
                     stateRef->controlState.store(LlmBotState::ControlState::Idle);
@@ -5905,19 +6049,19 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 }
                 else if (definition.capability == ControlAction::Capability::EnterAttackPull)
                 {
-                    if (!HasRemainingMissionObjective(snapshot))
+                    uint32 entryId = 0;
+                    if (!ParseEntryIdArguments(toolCall.arguments, entryId))
                     {
-                        LogControlToolRejected(toolCall.name, "mission_objective_complete");
+                        LogControlToolRejected(toolCall.name, "invalid_arguments");
                         stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
                         stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
                         clearBusy();
                         return;
                     }
 
-                    uint32 entryId = 0;
-                    if (!ParseEntryIdArguments(toolCall.arguments, entryId))
+                    if (!HasRemainingMissionObjective(snapshot, entryId))
                     {
-                        LogControlToolRejected(toolCall.name, "invalid_arguments");
+                        LogControlToolRejected(toolCall.name, "mission_objective_complete");
                         stateRef->controlState.store(LlmBotState::ControlState::Idle, std::memory_order_relaxed);
                         stateRef->nextPlannerShortTickMs.store(getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);
                         clearBusy();
@@ -5946,7 +6090,8 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     accepted = true;
                     gateReason = "exact_mission_target";
                 }
-                else if (definition.capability == ControlAction::Capability::GatherTarget)
+                else if (definition.capability == ControlAction::Capability::GatherTarget ||
+                         definition.capability == ControlAction::Capability::UseQuestObject)
                 {
                     uint32 entryId = 0;
                     if (!ParseEntryIdArguments(toolCall.arguments, entryId))
@@ -5979,7 +6124,8 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
 
                     action.gameObjectEntryId = entryId;
                     accepted = true;
-                    gateReason = "exact_gather_target";
+                    gateReason = definition.capability == ControlAction::Capability::UseQuestObject ?
+                        "quest_object_target" : "exact_gather_target";
                 }
                 else if (definition.capability == ControlAction::Capability::EnterGrind)
                 {
@@ -6284,23 +6430,24 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
 
                 if (hasAction && actionState.action.capability != ControlAction::Capability::Idle)
                 {
-                    {
-                        std::lock_guard<std::mutex> lock(GetBotLLMContextMutex());
-                        BotLLMContext &ctx = GetBotLLMContext()[guid];
-                        ctx.lastControlSummary = SummarizeControlAction(actionState.action);
-                        ctx.lastControlAtMs = GetNowMs();
-                    }
-                    if (shortTermGoalCount > 0 &&
-                        actionState.action.capability != ControlAction::Capability::MoveHop &&
-                        actionState.action.capability != ControlAction::Capability::MoveHopNpc)
-                    {
-                        size_t currentIndex = stateRef->shortTermIndex.load(std::memory_order_relaxed);
-                        size_t nextIndex = (currentIndex + 1) % shortTermGoalCount;
-                        stateRef->shortTermIndex.store(nextIndex, std::memory_order_relaxed);
-                    }
-                    if (BotMissionRegistry::Instance().RevisionMatches(guid, actionState.missionRevision) &&
+                    std::lock_guard<std::mutex> sessionLock(stateRef->sessionMutex);
+                    if (!stateRef->retired && BotMissionRegistry::Instance().RevisionMatches(guid, actionState.missionRevision) &&
                         GetBotLifecycleGeneration(guid) == actionState.lifecycleGeneration)
                     {
+                        {
+                            std::lock_guard<std::mutex> lock(GetBotLLMContextMutex());
+                            BotLLMContext &ctx = GetBotLLMContext()[guid];
+                            ctx.lastControlSummary = SummarizeControlAction(actionState.action);
+                            ctx.lastControlAtMs = GetNowMs();
+                        }
+                        if (shortTermGoalCount > 0 &&
+                            actionState.action.capability != ControlAction::Capability::MoveHop &&
+                            actionState.action.capability != ControlAction::Capability::MoveHopNpc)
+                        {
+                            size_t currentIndex = stateRef->shortTermIndex.load(std::memory_order_relaxed);
+                            size_t nextIndex = (currentIndex + 1) % shortTermGoalCount;
+                            stateRef->shortTermIndex.store(nextIndex, std::memory_order_relaxed);
+                        }
                         ControlActionRegistry::Instance().Enqueue(guid, actionState);
                     }
                     else

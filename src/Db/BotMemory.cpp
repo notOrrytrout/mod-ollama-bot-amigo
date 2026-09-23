@@ -171,6 +171,25 @@ void BotMemory::Update(uint32_t nowMs)
     }
 }
 
+void BotMemory::FlushPending()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_)
+        return;
+    EnsureLoaded();
+    if (plannerDirty_)
+    {
+        FlushPlanner();
+        plannerDirty_ = false;
+    }
+    FlushStuck();
+    if (vendorsDirty_)
+    {
+        FlushVendors();
+        vendorsDirty_ = false;
+    }
+}
+
 std::string BotMemory::GetLastGoal() const
 {
     std::lock_guard<std::mutex> lock(mutex_);

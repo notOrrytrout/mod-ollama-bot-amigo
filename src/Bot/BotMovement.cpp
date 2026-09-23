@@ -8,7 +8,9 @@
 #include "Player.h"
 #include "PlayerbotAI.h"
 #include "LastMovementValue.h"
+#include "ObjectAccessor.h"
 #include "Timer.h"
+#include "Util/PlayerbotsCompat.h"
 #include "Util/WorldPositionCompat.h"
 
 #include <algorithm>
@@ -19,7 +21,7 @@
 namespace
 {
     // Rate-limit MovePoint calls to avoid spamming and re-entrancy.
-    // With the additional `bot_->isMoving()` gate, this mostly controls how quickly we can
+    // With the additional `bot->isMoving()` gate, this mostly controls how quickly we can
     // enqueue the *next* point after the previous point finishes.
     constexpr uint32 kMinMovePointIntervalMs = 150;
 
@@ -65,8 +67,7 @@ bool BotMovement::StartPathMove(Player* bot, PlayerbotAI* ai, WorldPosition cons
         }
     }
 
-    bot_ = bot;
-    ai_ = ai;
+    botGuid_ = bot->GetGUID();
     reason_ = reason;
     interrupted_ = false;
 
@@ -81,8 +82,7 @@ bool BotMovement::StartPathMove(Player* bot, PlayerbotAI* ai, WorldPosition cons
 
     if (!BuildPath(dest))
     {
-        bot_ = nullptr;
-        ai_ = nullptr;
+        botGuid_.Clear();
         return false;
     }
 
@@ -93,21 +93,27 @@ bool BotMovement::StartPathMove(Player* bot, PlayerbotAI* ai, WorldPosition cons
 
 void BotMovement::Update(uint32 diff)
 {
-    if (!active_ || !bot_)
+    if (!active_)
         return;
+    Player* bot = ResolveBot();
+    if (!bot)
+    {
+        Abort(reason_);
+        return;
+    }
 
     lastMoveElapsedMs_ += diff;
 
     if (issuedPoint_)
     {
-        float dx = bot_->GetPositionX() - issuedX_;
-        float dy = bot_->GetPositionY() - issuedY_;
-        float dz = bot_->GetPositionZ() - issuedZ_;
+        float dx = bot->GetPositionX() - issuedX_;
+        float dy = bot->GetPositionY() - issuedY_;
+        float dz = bot->GetPositionZ() - issuedZ_;
         bool reachedPoint = std::sqrt(dx * dx + dy * dy + dz * dz) <= 0.8f;
-        auto* motion = bot_->GetMotionMaster();
+        auto* motion = bot->GetMotionMaster();
         bool sameGenerator = motion->top() == issuedGenerator_;
-        if (AmigoPointInterrupted(true, sameGenerator, bot_->movespline->GetId() == splineId_,
-            bot_->movespline->Finalized(), reachedPoint,
+        if (AmigoPointInterrupted(true, sameGenerator, bot->movespline->GetId() == splineId_,
+            bot->movespline->Finalized(), reachedPoint,
             motion->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE))
         {
             interrupted_ = true;
@@ -117,7 +123,7 @@ void BotMovement::Update(uint32 diff)
             return;
         }
         if (sameGenerator)
-            splineId_ = bot_->movespline->GetId();
+            splineId_ = bot->movespline->GetId();
         if (!sameGenerator && reachedPoint)
             issuedPoint_ = false;
     }
@@ -131,12 +137,13 @@ void BotMovement::Update(uint32 diff)
     if (ReachedDestination())
     {
         active_ = false;
+        issuedPoint_ = false;
         path_.clear();
         return;
     }
 
     // Don't overwrite an in-flight point movement.
-    if (bot_->isMoving())
+    if (bot->isMoving())
         return;
 
     if (lastMoveElapsedMs_ < kMinMovePointIntervalMs)
@@ -148,18 +155,13 @@ void BotMovement::Update(uint32 diff)
 
 void BotMovement::Abort(MoveReason /*reason*/)
 {
-    if (!bot_)
-    {
-        active_ = false;
-        path_.clear();
-        return;
-    }
+    Player* bot = ResolveBot();
 
-    if (AmigoOwnsPoint(issuedPoint_, splineId_, bot_->movespline->GetId(),
-        bot_->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE))
+    if (bot && AmigoOwnsPoint(issuedPoint_, splineId_, bot->movespline->GetId(),
+        bot->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE))
     {
-        bot_->GetMotionMaster()->Clear(false);
-        bot_->GetMotionMaster()->MoveIdle();
+        bot->GetMotionMaster()->Clear(false);
+        bot->GetMotionMaster()->MoveIdle();
     }
     issuedPoint_ = false;
     active_ = false;
@@ -175,7 +177,8 @@ bool BotMovement::ConsumeInterruption()
 
 bool BotMovement::BuildPath(WorldPosition const& dest)
 {
-    if (!bot_)
+    Player* bot = ResolveBot();
+    if (!bot)
         return false;
 
     // Playerbots WorldPosition accessors are not const-correct.
@@ -183,10 +186,10 @@ bool BotMovement::BuildPath(WorldPosition const& dest)
     WorldPosition destCopy = dest;
 
     // Enforce same-map pathing only; cross-map movement is not supported here.
-    if (bot_->GetMapId() != destCopy.GetMapId())
+    if (bot->GetMapId() != destCopy.GetMapId())
         return false;
 
-    PathGenerator pathGen(bot_);
+    PathGenerator pathGen(bot);
     // Playerbots explicitly disables straight-line shortcuts
     pathGen.SetUseStraightPath(false);
 
@@ -206,13 +209,14 @@ bool BotMovement::BuildPath(WorldPosition const& dest)
 
 float BotMovement::RemainingRoute() const
 {
-    if (!bot_)
+    Player* bot = ResolveBot();
+    if (!bot)
         return 0.0f;
 
     // The native spline advances even when a route bends away from the goal.
     // Report remaining route time in seconds, not straight-line distance.
-    if (issuedPoint_ && bot_->GetMotionMaster()->top() == issuedGenerator_)
-        return std::max(0, bot_->movespline->Duration() - bot_->movespline->timePassed()) / 1000.0f;
+    if (issuedPoint_ && bot->GetMotionMaster()->top() == issuedGenerator_)
+        return std::max(0, bot->movespline->Duration() - bot->movespline->timePassed()) / 1000.0f;
     return 0.0f;
 }
 
@@ -222,13 +226,14 @@ void BotMovement::Advance()
         return;
     // The reverted Playerbots API does not expose MoveToPosition(). Use the
     // core movement API after validating the route above.
-    if (!bot_ || bot_->GetMapId() != destMapId_)
+    Player* bot = ResolveBot();
+    if (!bot || bot->GetMapId() != destMapId_)
         return;
 
-    bot_->GetMotionMaster()->MovePoint(0, destX_, destY_, destZ_);
+    bot->GetMotionMaster()->MovePoint(0, destX_, destY_, destZ_);
 
-    splineId_ = bot_->movespline->GetId();
-    issuedGenerator_ = bot_->GetMotionMaster()->top();
+    splineId_ = bot->movespline->GetId();
+    issuedGenerator_ = bot->GetMotionMaster()->top();
     issuedX_ = destX_;
     issuedY_ = destY_;
     issuedZ_ = destZ_;
@@ -237,11 +242,12 @@ void BotMovement::Advance()
 
 bool BotMovement::ShouldAbort() const
 {
-    if (!bot_ || !bot_->IsAlive() || !bot_->IsInWorld())
+    Player* bot = ResolveBot();
+    if (!bot || !bot->IsAlive() || !bot->IsInWorld())
         return true;
 
     // Travel is interrupted by combat.
-    if (bot_->IsInCombat() && reason_ == MoveReason::Travel)
+    if (bot->IsInCombat() && reason_ == MoveReason::Travel)
         return true;
 
     return false;
@@ -249,12 +255,24 @@ bool BotMovement::ShouldAbort() const
 
 bool BotMovement::ReachedDestination() const
 {
-    if (!bot_)
+    Player* bot = ResolveBot();
+    if (!bot)
         return true;
 
-    float d2 = Dist2D(bot_->GetPositionX(), bot_->GetPositionY(), destX_, destY_);
-    float dz = std::fabs(bot_->GetPositionZ() - destZ_);
+    float d2 = Dist2D(bot->GetPositionX(), bot->GetPositionY(), destX_, destY_);
+    float dz = std::fabs(bot->GetPositionZ() - destZ_);
     return d2 <= kReachedEpsilon && dz <= 1.5f;
+}
+
+Player* BotMovement::ResolveBot() const
+{
+    return botGuid_.IsEmpty() ? nullptr : ObjectAccessor::FindPlayer(botGuid_);
+}
+
+PlayerbotAI* BotMovement::GetPlayerbotAI() const
+{
+    Player* bot = ResolveBot();
+    return bot ? sPlayerbotsMgr.GetPlayerbotAI(bot) : nullptr;
 }
 
 void BotMovementRegistry::Register(uint64 guid, BotMovement* movement)

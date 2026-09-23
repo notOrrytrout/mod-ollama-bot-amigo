@@ -5,6 +5,7 @@
 #include "Bot/BotLifecycle.h"
 #include "Script/OllamaBotConfig.h"
 #include "Ai/OllamaRuntime.h"
+#include "Script/OllamaBotControlLoop.h"
 #include "Log.h"
 #include "Util/PlayerbotsCompat.h"
 #include "Timer.h"
@@ -61,6 +62,12 @@ bool AmigoPlannerRegistry::TryDequeue(uint64 botGuid, AmigoPlannerState& out)
     out = it->second.front();
     it->second.pop_front();
     return true;
+}
+
+void AmigoPlannerRegistry::Clear(uint64 botGuid)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    plans_.erase(botGuid);
 }
 
 AmigoPlannerApplierScript::AmigoPlannerApplierScript()
@@ -203,4 +210,9 @@ void AmigoBotLoginScript::OnPlayerLogin(Player* player)
     {
         LOG_INFO("server.loading", "[OllamaBotAmigo] Reset bot strategies on login for {}", player->GetName());
     }
+}
+
+void AmigoBotLoginScript::OnPlayerBeforeLogout(Player* player)
+{
+    RetireAmigoBotState(player);
 }

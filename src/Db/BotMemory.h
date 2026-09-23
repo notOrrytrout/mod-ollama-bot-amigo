@@ -27,6 +27,7 @@ public:
 
     void Initialize(uint64_t botGuid, uint32_t nowMs);
     void Update(uint32_t nowMs);
+    void FlushPending();
 
     // Planner memory
     std::string GetLastGoal() const;

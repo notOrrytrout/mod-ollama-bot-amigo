@@ -2,6 +2,8 @@
 #include "ScriptMgr.h"
 #include <string>
 
+class Player;
+
 enum class LlmView : uint8
 {
     Planner,
@@ -21,3 +23,4 @@ public:
 
 // Exact compact STATE_JSON most recently supplied to the control model.
 std::string GetAmigoLatestControlStateJson();
+void RetireAmigoBotState(Player* player);

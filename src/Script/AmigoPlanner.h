@@ -30,6 +30,7 @@ public:
     void Enqueue(Player* bot, AmigoPlannerState const& plan);
     void Enqueue(uint64 botGuid, AmigoPlannerState const& plan);
     bool TryDequeue(uint64 botGuid, AmigoPlannerState& out);
+    void Clear(uint64 botGuid);
 
 private:
     std::mutex mutex_;
@@ -50,4 +51,5 @@ public:
     AmigoBotLoginScript();
     // Reset bot strategies when the bot logs in.
     void OnPlayerLogin(Player* player) override;
+    void OnPlayerBeforeLogout(Player* player) override;
 };

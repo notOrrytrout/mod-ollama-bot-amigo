@@ -17,6 +17,8 @@ namespace
          "attack the exact nearby creature target", "the target is acted on or objective progress changes", "target is not an exact live mission target"},
         {"request_gather_target", "request_gather_target(entry_id)", Capability::GatherTarget, false, false, false, true, false, false, false, false, false, false, true,
          "gather the exact nearby game object", "the object is added to Playerbots loot handling", "object is invalid or not gatherable"},
+        {"request_use_quest_object", "request_use_quest_object(entry_id)", Capability::UseQuestObject, false, false, false, true, false, false, false, false, false, false, true,
+         "use a nearby game object required by an active quest", "the quest objective count increases", "quest object is invalid or out of range"},
         {"request_stop_grind", "request_stop_grind()", Capability::StopGrind, false, false, false, false, false, false, false, false, false, false, false,
          "stop the grind activity", "grind mode is cleared", "bot is not grinding"},
         {"request_stay", "request_stay()", Capability::Stay, false, false, false, false, false, false, false, false, false, false, false,
@@ -87,4 +89,10 @@ bool ControlActionRegistry::TryDequeue(uint64 botGuid, ControlActionState& outAc
     outAction = it->second.front();
     it->second.pop_front();
     return true;
+}
+
+void ControlActionRegistry::Clear(uint64 botGuid)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    actions_.erase(botGuid);
 }

@@ -85,6 +85,7 @@ namespace
             case ControlAction::Capability::EnterGrind:         return "enter_grind";
             case ControlAction::Capability::EnterAttackPull:    return "attack_target";
             case ControlAction::Capability::GatherTarget:       return "gather_target";
+            case ControlAction::Capability::UseQuestObject:    return "use_quest_object";
             case ControlAction::Capability::VendorSell:        return "vendor_sell";
             case ControlAction::Capability::VendorBuyUseful:   return "vendor_buy_useful";
             case ControlAction::Capability::Repair:            return "repair";
@@ -480,6 +481,25 @@ namespace
     }
 }
 
+void AmigoControlControllerScript::OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid lootGuid)
+{
+    if (!player || !item || !count || !lootGuid.IsGameObject())
+        return;
+    GameObject* fishingSource = ObjectAccessor::GetGameObject(*player, lootGuid);
+    if (!fishingSource)
+        return;
+
+    bool ownedBobber = fishingSource->GetGoType() == GAMEOBJECT_TYPE_FISHINGNODE &&
+        fishingSource->GetOwnerGUID() == player->GetGUID();
+    bool fishingHole = fishingSource->GetGoType() == GAMEOBJECT_TYPE_FISHINGHOLE;
+    if (!ownedBobber && !fishingHole)
+        return;
+
+    BotProfession* profession = BotProfessionRegistry::Get(player->GetGUID().GetRawValue());
+    if (profession && profession->RecordFishingCatch(getMSTime()))
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Fishing catch verified for {}", player->GetName());
+}
+
 AmigoControlControllerScript::AmigoControlControllerScript()
     : PlayerScript("AmigoControlControllerScript")
 {
@@ -488,6 +508,12 @@ AmigoControlControllerScript::AmigoControlControllerScript()
 bool HasAmigoPendingControl(uint64 botGuid)
 {
     return pendingQuestGiverFollowups.find(botGuid) != pendingQuestGiverFollowups.end();
+}
+
+void ClearAmigoPendingControl(uint64 botGuid)
+{
+    pendingQuestGiverFollowups.erase(botGuid);
+    lastPlannerRefreshMs.erase(botGuid);
 }
 
 void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*diff*/)
@@ -992,6 +1018,38 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         LOG_INFO("server.loading", "[OllamaBotAmigo] Targeted grind attack accepted for {}: {} (entry={}, action={})",
                  player->GetName(), target->GetName(), target->GetEntry(), attackAction);
         EnqueueBotControlCommand(player, command, actionState.reasoning);
+        return;
+    }
+
+    if (actionState.action.capability == ControlAction::Capability::UseQuestObject)
+    {
+        uint32 questId = actionState.action.questId;
+        uint32 entryId = actionState.action.gameObjectEntryId;
+        if (!questId || !entryId || player->GetQuestStatus(questId) != QUEST_STATUS_INCOMPLETE ||
+            BotMissionRegistry::Instance().Get(guid).mission.kind != BotMissionKind::Quest)
+            return;
+
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        auto const& statuses = player->getQuestStatusMap();
+        auto status = statuses.find(questId);
+        bool remaining = false;
+        if (quest && status != statuses.end())
+            for (uint8 index = 0; index < QUEST_OBJECTIVES_COUNT; ++index)
+                remaining = remaining || (quest->RequiredNpcOrGo[index] == -static_cast<int32>(entryId) &&
+                    status->second.CreatureOrGOCount[index] < quest->RequiredNpcOrGoCount[index]);
+        if (!remaining)
+            return;
+
+        GameObject* target = FindNearestGameObjectByEntryId(player, ai, entryId);
+        if (!target || target->GetGoState() != GO_STATE_READY ||
+            target->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_NOT_SELECTABLE) ||
+            player->GetDistance(target) > INTERACTION_DISTANCE || !player->IsWithinLOSInMap(target) ||
+            (target->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_INTERACT_COND) && !target->ActivateToQuest(player)))
+            return;
+
+        target->Use(player);
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Used quest object for {}: quest={} entry={}",
+            player->GetName(), questId, entryId);
         return;
     }
 

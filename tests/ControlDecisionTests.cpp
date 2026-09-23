@@ -171,7 +171,16 @@ int main()
     state["decision_options"][0]["action"] = "request_gather_target";
     Check(SelectControlDecision(state).at("name") == "request_gather_target",
         "item objective must permit a server-approved object collection");
+    state["decision_options"][0]["action"] = "request_use_quest_object";
+    state["decision_options"][0]["objective_type"] = "game_object";
+    Check(SelectControlDecision(state).at("name") == "request_use_quest_object",
+        "in-range quest object must be used");
+    state["decision_options"] = Json::array({
+        Json{{"action", "request_move_hop"}, {"priority", 20}, {"quest_id", 313},
+             {"objective_type", "game_object"}, {"arguments", {{"candidate_id", "nav_11"}}}}});
+    Check(SelectControlDecision(state).at("arguments").at("candidate_id") == "nav_11",
+        "out-of-range quest object must use its approved approach candidate");
     state["bot"]["active_quests"][0]["status"] = "complete";
-    Check(SelectControlDecision(state).empty(), "completed quest must suppress further item collection");
+    Check(SelectControlDecision(state).empty(), "completed quest must suppress further objective actions");
     std::cout << "Control decision checks passed\n";
 }

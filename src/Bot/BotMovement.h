@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Define.h"
+#include "ObjectGuid.h"
 #include "PathGenerator.h" // Movement::PointsArray
 
 #include <cstdint>
@@ -40,7 +41,7 @@ public:
     float RemainingRoute() const;
     bool IsMoving() const { return active_; }
     bool ConsumeInterruption();
-    PlayerbotAI* GetPlayerbotAI() const { return ai_; }
+    PlayerbotAI* GetPlayerbotAI() const;
 
 private:
     bool BuildPath(WorldPosition const& dest);
@@ -49,8 +50,8 @@ private:
     bool ReachedDestination() const;
 
 private:
-    Player* bot_ = nullptr;
-    PlayerbotAI* ai_ = nullptr;
+    ObjectGuid botGuid_;
+    Player* ResolveBot() const;
     Movement::PointsArray path_;
     MoveReason reason_ = MoveReason::Travel;
 

@@ -31,6 +31,7 @@ struct ControlAction
         EnterAttackPull,
         // Gather one exact nearby game object selected by entry ID.
         GatherTarget,
+        UseQuestObject,
         // Native Playerbots service and recovery capabilities.
         VendorSell,
         VendorBuyUseful,
@@ -134,6 +135,7 @@ public:
     static ControlActionRegistry& Instance();
     void Enqueue(uint64 botGuid, ControlActionState const& action);
     bool TryDequeue(uint64 botGuid, ControlActionState& outAction);
+    void Clear(uint64 botGuid);
 
 private:
     std::mutex mutex_;

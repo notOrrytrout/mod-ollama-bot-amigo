@@ -152,6 +152,18 @@ void BotProfession::Abort(Player*, PlayerbotAI* ai, uint32_t nowMs)
     bobberStrategySeen_ = false;
 }
 
+bool BotProfession::RecordFishingCatch(uint32_t nowMs)
+{
+    if (!active_ || activity_ != ProfessionActivity::Fishing)
+        return false;
+    active_ = false;
+    activity_ = ProfessionActivity::None;
+    lastResult_ = ProfessionResult::Succeeded;
+    lastChangeMs_ = nowMs;
+    bobberStrategySeen_ = false;
+    return true;
+}
+
 std::mutex BotProfessionRegistry::mutex_;
 std::unordered_map<uint64_t, BotProfession*> BotProfessionRegistry::byGuid_;
 

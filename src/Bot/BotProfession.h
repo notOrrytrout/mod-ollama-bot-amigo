@@ -23,6 +23,7 @@ public:
 
     void Update(Player* bot, PlayerbotAI* ai, uint32_t nowMs);
     void Abort(Player* bot, PlayerbotAI* ai, uint32_t nowMs);
+    bool RecordFishingCatch(uint32_t nowMs);
 
     bool Active() const { return active_; }
     ProfessionActivity Activity() const { return activity_; }

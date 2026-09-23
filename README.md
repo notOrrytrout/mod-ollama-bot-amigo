@@ -167,6 +167,7 @@ The following table is generated from `src/Ai/ControlAction.cpp`.
 | `request_enter_grind()` | Playerbots enters grind strategy |
 | `request_attack_target(entry_id)` | the target is acted on or objective progress changes |
 | `request_gather_target(entry_id)` | the object is added to Playerbots loot handling |
+| `request_use_quest_object(entry_id)` | the quest objective count increases |
 | `request_stop_grind()` | grind mode is cleared |
 | `request_stay()` | the stay strategy is active |
 | `request_unstay()` | the stay strategy is cleared |
@@ -186,6 +187,7 @@ Notes:
 - `request_move_hop` must echo `STATE_JSON.nav.nav_epoch` and choose a `candidate_id` from `STATE_JSON.nav.candidates` (only choose candidates where `can_move` is true, and preferably where `reachable` is true).
 - `request_stop_grind` should be used when `STATE_JSON.bot.grind_mode` is true but you need to travel/quest/talk (it maps to Playerbot `follow`, and is allowed even if the bot is currently moving).
 - `request_talk_to_quest_giver` must use a quest id from a `STATE_JSON.quest_givers_in_range` entry (`available_quest_ids` or `turn_in_quest_ids`).
+- `request_use_quest_object` is offered only for an incomplete quest objective that requires using a nearby game object.
 - `request_profession` currently supports `skill="fishing"` and `intent="fish"` only.
 
 Examples:
@@ -349,6 +351,6 @@ The control and planner mocks run inside Amigo. They do not require a separate m
 
 ## Quest item source behavior
 
-For an active quest item objective, Amigo checks Playerbots' server-side loot data before it selects a target. It can route to a nearby creature that can drop the item or to a nearby game object that provides it. The controller checks the same objective state before it executes the attack or gather action.
+For an active quest item objective, Amigo checks Playerbots' server-side loot data before it selects a target. It can route to a nearby creature that can drop the item or to a nearby game object that provides it. The controller checks the same objective state before it executes the attack or gather action. For a separate quest objective that requires activating a game object, Amigo approaches the object and uses it only while that objective remains incomplete.
 
 If no valid source is known or the bot already has enough of the item, Amigo does not invent a kill target. It waits for another valid control action or for the normal Playerbots systems to make progress.
