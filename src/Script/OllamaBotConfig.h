@@ -97,8 +97,10 @@ public:
     OllamaBotControlConfigWorldScript();
     void OnStartup() override;
     void OnAfterConfigLoad(bool reload) override;
+    void OnUpdate(uint32 diff) override;
     void OnShutdown() override;
 
 private:
     void LoadConfig();
+    bool reloadPending_ = false;
 };

@@ -115,6 +115,9 @@ All configuration is in `mod_ollama_bot_amigo.conf`. Key settings:
 - **OllamaBotControl.EnablePlannerMemory / .EnableStuckMemory / .EnableVendorMemory:**
   Toggles for enabling planner/stuck/vendor memory storage tables.
 
+- **OllamaBotControl.Llm.WorkerThreads / .MaxQueueDepth:**
+  Sets the worker count and queue limit. Amigo applies reloaded settings after queued requests, active requests, and pending callbacks finish. Worker count changes take effect after a worldserver restart; the queue limit can change on reload.
+
 - **OllamaBotControl.QuestingOnly / OllamaBotControl.Planner.ForcedLongTermGoal:**
   Helpers for running the bot as a dedicated questing bot. `QuestingOnly=1` injects a default questing long-term goal (unless `Planner.ForcedLongTermGoal` is set explicitly).
 

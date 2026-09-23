@@ -17,6 +17,7 @@ namespace
     std::mutex gCompletionMutex;
     std::deque<std::function<void()>> gCompletions;
     bool gRunning = false;
+    bool gAccepting = false;
     uint32_t gMaxQueueDepth = 32;
 
     std::atomic<uint32_t> gInFlight{0};
@@ -46,9 +47,9 @@ namespace
                     return;
                 job = std::move(gQueue.front());
                 gQueue.pop_front();
+                ++gInFlight;
             }
 
-            ++gInFlight;
             try
             {
                 job();
@@ -75,6 +76,7 @@ void AmigoLlmDispatchStart(uint32_t workerCount, uint32_t maxQueueDepth)
     if (gRunning)
         return;
     gRunning = true;
+    gAccepting = true;
     gMaxQueueDepth = maxQueueDepth ? maxQueueDepth : 1;
     workerCount = workerCount ? workerCount : 1;
     for (uint32_t i = 0; i < workerCount; ++i)
@@ -92,6 +94,7 @@ void AmigoLlmDispatchStop()
         // Workers that are already inside an HTTP call are allowed to finish,
         // then they observe !gRunning with an empty queue and exit.
         gRunning = false;
+        gAccepting = false;
         gQueue.clear();
     }
     gQueueCv.notify_all();
@@ -109,8 +112,43 @@ void AmigoLlmDispatchStop()
 
 void AmigoLlmDispatchReconfigure(uint32_t workerCount, uint32_t maxQueueDepth)
 {
-    AmigoLlmDispatchStop();
+    {
+        std::lock_guard<std::mutex> lock(gQueueMutex);
+        if (gRunning)
+        {
+            gMaxQueueDepth = maxQueueDepth ? maxQueueDepth : 1;
+            uint32_t requestedWorkerCount = workerCount ? workerCount : 1;
+            if (requestedWorkerCount != gWorkers.size())
+            {
+                LOG_INFO("server.loading",
+                         "[OllamaBotAmigo] LLM worker count changed in config; restart worldserver to apply it.");
+            }
+            return;
+        }
+    }
+
     AmigoLlmDispatchStart(workerCount, maxQueueDepth);
+}
+
+bool AmigoLlmDispatchBeginConfigUpdate()
+{
+    std::lock_guard<std::mutex> queueLock(gQueueMutex);
+    if (!gRunning || !gAccepting || !gQueue.empty() || gInFlight.load())
+        return false;
+
+    std::lock_guard<std::mutex> completionLock(gCompletionMutex);
+    if (!gCompletions.empty())
+        return false;
+
+    gAccepting = false;
+    return true;
+}
+
+void AmigoLlmDispatchEndConfigUpdate()
+{
+    std::lock_guard<std::mutex> lock(gQueueMutex);
+    if (gRunning)
+        gAccepting = true;
 }
 
 bool AmigoLlmDispatchSubmit(std::function<void()> job)
@@ -119,7 +157,7 @@ bool AmigoLlmDispatchSubmit(std::function<void()> job)
         return false;
     {
         std::lock_guard<std::mutex> lock(gQueueMutex);
-        if (!gRunning || gQueue.size() >= gMaxQueueDepth)
+        if (!gRunning || !gAccepting || gQueue.size() >= gMaxQueueDepth)
         {
             ++gDroppedQueueFull;
             return false;

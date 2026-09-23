@@ -20,6 +20,8 @@ struct AmigoLlmDispatchStats
 void AmigoLlmDispatchStart(uint32_t workerCount, uint32_t maxQueueDepth);
 void AmigoLlmDispatchStop();
 void AmigoLlmDispatchReconfigure(uint32_t workerCount, uint32_t maxQueueDepth);
+bool AmigoLlmDispatchBeginConfigUpdate();
+void AmigoLlmDispatchEndConfigUpdate();
 bool AmigoLlmDispatchSubmit(std::function<void()> job);
 AmigoLlmDispatchStats AmigoLlmDispatchGetStats();
 // Queue a callback for world-thread delivery. Worker jobs may call this with

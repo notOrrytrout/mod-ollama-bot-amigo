@@ -124,11 +124,31 @@ OllamaBotControlConfigWorldScript::OllamaBotControlConfigWorldScript() : WorldSc
 
 void OllamaBotControlConfigWorldScript::OnStartup()
 {
+    reloadPending_ = false;
     LoadConfig();
 }
 
-void OllamaBotControlConfigWorldScript::OnAfterConfigLoad(bool /*reload*/)
+void OllamaBotControlConfigWorldScript::OnAfterConfigLoad(bool reload)
 {
+    if (reload)
+    {
+        reloadPending_ = true;
+        LOG_INFO("server.loading", "[OllamaBotAmigo] Deferring config reload until LLM jobs and callbacks finish.");
+        return;
+    }
+
+    LoadConfig();
+}
+
+void OllamaBotControlConfigWorldScript::OnUpdate(uint32 /*diff*/)
+{
+    if (!reloadPending_)
+        return;
+
+    if (!AmigoLlmDispatchBeginConfigUpdate())
+        return;
+
+    reloadPending_ = false;
     LoadConfig();
 }
 
@@ -269,9 +289,10 @@ void OllamaBotControlConfigWorldScript::LoadConfig()
 
     // Publish immutable worker settings before restarting the queue.
     PublishOllamaClientConfig();
-    // Safe on startup and config reload. Existing queued work is discarded on reload.
+    // Keep the worker pool running across reloads so queued work is preserved.
     AmigoLlmDispatchReconfigure(g_AmigoLlmWorkerThreads, g_AmigoLlmMaxQueueDepth);
     ResetOllamaThinkCapability();
+    AmigoLlmDispatchEndConfigUpdate();
     if (g_AmigoThinkPlanner && !g_OllamaBotControlPlannerModel.empty())
     {
         std::string probeModel = g_OllamaBotControlPlannerModel;

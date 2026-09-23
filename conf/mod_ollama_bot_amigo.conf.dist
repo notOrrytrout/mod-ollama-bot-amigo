@@ -160,6 +160,7 @@ OllamaBotControl.SystemPrompt.ShortTerm =
 ############################
 # Fixed worker pool. Requests beyond MaxQueueDepth are dropped instead of
 # accumulating stale work.
+# WorkerThreads is set at startup. Restart worldserver to change it.
 OllamaBotControl.Llm.WorkerThreads = 2
 OllamaBotControl.Llm.MaxQueueDepth = 32
 OllamaBotControl.Llm.Think.Planner = 1
