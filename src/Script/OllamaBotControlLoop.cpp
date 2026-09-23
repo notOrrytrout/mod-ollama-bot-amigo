@@ -11,6 +11,7 @@
 #include "Ai/LlmRoles.h"
 #include "DBCStores.h"
 #include "Util/PlayerbotsCompat.h"
+#include "Util/QuestItemSources.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "Item.h"
@@ -217,6 +218,7 @@ namespace
         {
             std::string label;
             Position3 pos;
+            std::vector<uint32> questIds;
             bool canMove = false;
             // Engine-derived feasibility signals.
             bool hasLOS = false;
@@ -237,6 +239,7 @@ namespace
             std::string targetName;
             uint32 current = 0;
             uint32 required = 0;
+            int32 objectiveIndex = -1;
         };
         struct QuestProgress
         {
@@ -273,6 +276,7 @@ namespace
             float distance = 0.0f;
             bool isQuestGiver = false;
             std::string questMarker;
+            std::vector<uint32> availableQuestIds;
             bool isVendor = false;
             bool isTrainer = false;
             bool isRepair = false;
@@ -799,6 +803,18 @@ namespace
             if (!value || !stack)
                 return true;
             LootObject target = value->Get();
+            LootObject nearby = stack->GetLoot(sPlayerbotAIConfig.lootDistance);
+
+            // Playerbots can retain a previous target while a nearer corpse
+            // is already in interaction range. Prefer that nearby target so
+            // the bot opens it now instead of walking away and returning.
+            WorldObject* nearbyObject = nearby.IsEmpty() ? nullptr : nearby.GetWorldObject(bot);
+            if (nearbyObject && bot->GetDistance(nearbyObject) <= INTERACTION_DISTANCE - 2.0f &&
+                (target.IsEmpty() || target.guid != nearby.guid))
+            {
+                target = nearby;
+                value->Set(target);
+            }
             // Packet-driven Playerbots actions own collection and release.
             if (pending.Collecting(bot->GetLootGUID().GetRawValue(), bot->IsNonMeleeSpellCast(false), nowMs))
                 return true;
@@ -806,7 +822,7 @@ namespace
             BotLootPhase phase = target.IsEmpty() ? BotLootPhase::Select :
                 object && bot->GetDistance(object) <= INTERACTION_DISTANCE - 2.0f
                     ? BotLootPhase::Open : BotLootPhase::Approach;
-            LootObject candidate = target.IsEmpty() ? stack->GetLoot(sPlayerbotAIConfig.lootDistance) : target;
+            LootObject candidate = target.IsEmpty() ? nearby : target;
             float remaining = object ? bot->GetDistance(object) : 0.0f;
             pending.Observe(candidate.guid.GetRawValue(), phase, remaining, nowMs);
             if (phase == BotLootPhase::Approach && bot->movespline->Initialized())
@@ -1703,20 +1719,15 @@ request_profession format:
 
             // Resolve a ground/water Z at the candidate X/Y to avoid "mid-air" points.
             if (map)
-            {
-                float height = map->GetHeight(x, y, MAX_HEIGHT);
-                float water = map->GetWaterLevel(x, y);
-                float candidateZ = std::max(height, water);
-                if (candidateZ != INVALID_HEIGHT)
-                    z = candidateZ;
-            }
+                WorldChecks::ResolveGroundZ(bot, x, y, origin.z, z);
 
             candidate.pos = Position3{x, y, z};
 
             // Derived, engine-backed feasibility signals.
             WorldPosition wp(mapId, x, y, z);
             candidate.hasLOS = WorldChecks::IsWithinLOS(bot, wp);
-            candidate.reachable = WorldChecks::CanReach(bot, wp);
+            candidate.reachable = WorldChecks::IsSafeGroundDestination(bot, wp) &&
+                                  WorldChecks::CanReach(bot, wp);
 
             // Presentation helpers for the LLM.
             candidate.distance2d = Distance2d(origin, candidate.pos);
@@ -1828,13 +1839,7 @@ request_profession format:
             float z = origin.z;
 
             if (map)
-            {
-                float height = map->GetHeight(x, y, MAX_HEIGHT);
-                float water = map->GetWaterLevel(x, y);
-                float candidateZ = std::max(height, water);
-                if (candidateZ != INVALID_HEIGHT)
-                    z = candidateZ;
-            }
+                WorldChecks::ResolveGroundZ(bot, x, y, origin.z, z);
 
             BotSnapshot::NavCandidate candidate;
             std::string label = "quest_giver";
@@ -1846,10 +1851,12 @@ request_profession format:
             }
             candidate.label = std::move(label);
             candidate.pos = Position3{x, y, z};
+            candidate.questIds = entity.availableQuestIds;
 
             WorldPosition wp(mapId, x, y, z);
             candidate.hasLOS = WorldChecks::IsWithinLOS(bot, wp);
-            candidate.reachable = WorldChecks::CanReach(bot, wp);
+            candidate.reachable = WorldChecks::IsSafeGroundDestination(bot, wp) &&
+                                  WorldChecks::CanReach(bot, wp);
             candidate.distance2d = Distance2d(origin, candidate.pos);
             candidate.bearingDeg = BearingDegrees(origin, candidate.pos);
             candidate.direction = DirectionLabelFromBearing(candidate.bearingDeg);
@@ -2095,17 +2102,18 @@ request_profession format:
                         hasTurnIn = true;
                     }
                 }
-                if (!hasTurnIn)
+                for (auto it = startBounds.first; it != startBounds.second; ++it)
                 {
-                    for (auto it = startBounds.first; it != startBounds.second; ++it)
-                    {
-                        uint32 questId = it->second;
-                        if (bot->GetQuestStatus(questId) == QUEST_STATUS_NONE)
-                        {
-                            hasAvailable = true;
-                            break;
-                        }
-                    }
+                    uint32 questId = it->second;
+                    if (bot->GetQuestStatus(questId) != QUEST_STATUS_NONE)
+                        continue;
+
+                    Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+                    if (!quest || !bot->CanTakeQuest(quest, false))
+                        continue;
+
+                    entity.availableQuestIds.push_back(questId);
+                    hasAvailable = true;
                 }
                 if (hasTurnIn)
                 {
@@ -2193,6 +2201,42 @@ request_profession format:
                     route.isTurnIn = true;
                     results.push_back(std::move(route));
                     continue;
+                }
+            }
+
+            // Item quests need a route to a known loot source even when no
+            // matching creature or object is currently visible.
+            if (statusData.Status == QUEST_STATUS_INCOMPLETE)
+            {
+                WorldPosition origin(bot);
+                auto destinations = TravelMgr::instance().getQuestTravelDestinations(
+                    bot, questId, true, false, 0, false);
+                for (uint8 index = 0; index < QUEST_ITEM_OBJECTIVES_COUNT; ++index)
+                {
+                    if (!quest->RequiredItemCount[index] ||
+                        bot->GetItemCount(quest->RequiredItemId[index]) >= quest->RequiredItemCount[index])
+                        continue;
+                    WorldPosition* closest = nullptr;
+                    for (auto* destination : destinations)
+                    {
+                        if (!destination || destination->getName() != "QuestObjectiveTravelDestination" ||
+                            !AmigoDropsQuestItem(destination->getEntry(), quest->RequiredItemId[index]))
+                            continue;
+                        for (auto* point : destination->nextPoint(&origin, true))
+                            if (point && point->GetMapId() == bot->GetMapId() &&
+                                (!closest || origin.distance(*point) < origin.distance(*closest)))
+                                closest = point;
+                    }
+                    if (!closest)
+                        continue;
+                    BotSnapshot::QuestPoi route;
+                    route.questId = questId;
+                    route.objectiveIndex = QUEST_OBJECTIVES_COUNT + index;
+                    route.mapId = bot->GetMapId();
+                    route.pos = {closest->GetPositionX(), closest->GetPositionY(), closest->GetPositionZ()};
+                    route.hasZ = true;
+                    route.isTurnIn = false;
+                    results.push_back(std::move(route));
                 }
             }
 
@@ -2629,7 +2673,8 @@ request_profession format:
                                 static_cast<int32>(quest->RequiredItemId[i]),
                                 itemName,
                                 entry.second.ItemCount[i],
-                                quest->RequiredItemCount[i]});
+                                quest->RequiredItemCount[i],
+                                static_cast<int32>(QUEST_OBJECTIVES_COUNT + i)});
                         }
                     }
 
@@ -2659,7 +2704,8 @@ request_profession format:
                                 quest->RequiredNpcOrGo[i],
                                 targetName,
                                 entry.second.CreatureOrGOCount[i],
-                                quest->RequiredNpcOrGoCount[i]});
+                                quest->RequiredNpcOrGoCount[i],
+                                static_cast<int32>(i)});
                         }
                     }
 
@@ -2670,7 +2716,8 @@ request_profession format:
                             0,
                             std::string("players"),
                             entry.second.PlayerCount,
-                            quest->GetPlayersSlain()});
+                            quest->GetPlayersSlain(),
+                            -1});
                     }
                 }
 
@@ -2817,29 +2864,98 @@ request_profession format:
                     continue;
                 for (auto const &objective : quest.objectives)
                 {
-                    if (objective.current >= objective.required || objective.targetName.empty())
+                    if (objective.current >= objective.required ||
+                        (objective.type != "item" && objective.targetName.empty()))
                         continue;
 
                     for (auto const &entity : snapshot.nearbyEntities)
                     {
-                        if (entity.type != "npc" || entity.name != objective.targetName || objective.type != "creature")
+                        bool itemSource = objective.type == "item" && AmigoDropsQuestItem(
+                            entity.type == "npc" ? static_cast<int32>(entity.entryId) :
+                                -static_cast<int32>(entity.entryId), static_cast<uint32>(objective.targetId));
+                        bool creatureObjective = entity.type == "npc" && entity.name == objective.targetName &&
+                            objective.type == "creature";
+                        if (!itemSource && !creatureObjective)
                             continue;
+                        if (entity.type == "npc")
+                        {
+                            bool attackable = false;
+                            for (ObjectGuid npcGuid : ai->GetAiObjectContext()->GetValue<GuidVector>("nearest npcs")->Get())
+                            {
+                                Creature* npc = ai->GetCreature(npcGuid);
+                                if (npc && npc->GetEntry() == entity.entryId && npc->IsAlive() && bot->IsValidAttackTarget(npc))
+                                {
+                                    attackable = true;
+                                    break;
+                                }
+                            }
+                            if (!attackable)
+                                continue;
+                        }
                         if (snapshot.mission.kind != BotMissionKind::Quest &&
                             (snapshot.mission.kind != BotMissionKind::Grind ||
                              !snapshot.mission.MatchesTargetName(entity.name)))
                             continue;
 
                         ControlDecisionOption option;
-                        option.action = "request_attack_target";
+                        option.action = entity.type == "npc" ? "request_attack_target" : "request_gather_target";
                         option.questId = quest.questId;
                         option.entryId = entity.entryId;
-                        option.targetName = objective.targetName;
-                        option.reason = "exact incomplete creature objective";
+                        option.targetName = entity.name;
+                        option.sourceTarget = itemSource ? entity.name : std::string();
+                        option.reason = itemSource ? "server-mapped source of a required quest item" :
+                            "exact incomplete creature objective";
                         option.distance = entity.distance;
                         option.objectiveType = objective.type;
                         option.objectiveTargetId = objective.targetId;
                         addDecisionOption(std::move(option), "attack_objective:" + objective.targetName +
                                           " | " + DistanceText(entity.distance));
+                        break;
+                    }
+
+                    if ((objective.type != "creature" && objective.type != "item") || objective.objectiveIndex < 0)
+                        continue;
+
+                    // Move one server-approved hop toward the quest objective
+                    // area when the exact creature is not visible yet. The
+                    // next control tick will select the creature directly once
+                    // it enters the nearby-entity snapshot.
+                    for (auto const &poi : snapshot.questPois)
+                    {
+                        if (poi.questId != quest.questId || poi.isTurnIn ||
+                            poi.objectiveIndex != objective.objectiveIndex ||
+                            poi.mapId != snapshot.mapId)
+                            continue;
+
+                        size_t bestIndex = snapshot.navCandidates.size();
+                        float bestDistance = Distance2d(snapshot.pos, poi.pos);
+                        for (size_t index = 0; index < snapshot.navCandidates.size(); ++index)
+                        {
+                            auto const &candidate = snapshot.navCandidates[index];
+                            if (!candidate.canMove || !candidate.reachable || candidate.temporarilyBlocked ||
+                                Distance2d(candidate.pos, poi.pos) >= bestDistance)
+                                continue;
+                            bestIndex = index;
+                            bestDistance = Distance2d(candidate.pos, poi.pos);
+                        }
+                        if (bestIndex == snapshot.navCandidates.size())
+                            continue;
+
+                        auto const &candidate = snapshot.navCandidates[bestIndex];
+                        ControlDecisionOption option;
+                        option.action = "request_move_hop";
+                        option.questId = quest.questId;
+                        option.targetName = objective.targetName;
+                        option.reason = "move toward the server-identified quest objective area";
+                        option.distance = candidate.distance2d;
+                        option.local = false;
+                        option.destinationType = "quest_objective_search_area";
+                        option.navigationDirection = candidate.direction;
+                        option.candidateId = "nav_" + std::to_string(bestIndex);
+                        option.objectiveType = objective.type;
+                        option.objectiveTargetId = objective.targetId;
+                        addDecisionOption(std::move(option), "move_to_objective:" + objective.targetName +
+                                          " | " + candidate.direction + " | " + DistanceText(candidate.distance2d));
                         break;
                     }
                 }
@@ -2857,6 +2973,28 @@ request_profession format:
                     option.distance = giver.distance;
                     option.local = true;
                     addDecisionOption(std::move(option), "accept_quest:" + std::to_string(questId));
+                }
+            }
+
+            for (size_t index = 0; index < snapshot.navCandidates.size(); ++index)
+            {
+                auto const& candidate = snapshot.navCandidates[index];
+                if (candidate.questIds.empty() || !candidate.canMove || !candidate.reachable ||
+                    candidate.temporarilyBlocked)
+                    continue;
+
+                for (uint32 questId : candidate.questIds)
+                {
+                    ControlDecisionOption option;
+                    option.action = "request_move_hop";
+                    option.questId = questId;
+                    option.reason = "move to a quest giver before accepting the available quest";
+                    option.distance = candidate.distance2d;
+                    option.local = false;
+                    option.destinationType = "quest_giver";
+                    option.candidateId = "nav_" + std::to_string(index);
+                    addDecisionOption(std::move(option), "move_to_quest_giver | " + candidate.direction +
+                                      " | " + DistanceText(candidate.distance2d));
                 }
             }
 
@@ -2892,6 +3030,35 @@ request_profession format:
                 option.action = "request_enter_grind";
                 option.reason = "continue the configured grind mission";
                 addDecisionOption(std::move(option), "continue_grind");
+            }
+        }
+
+        // Keep the server-approved option set non-empty when the bot is free
+        // but no specific mission target is currently visible. A reachable
+        // navigation hop is the next safe step while searching for an
+        // objective, and must be present here so control validation accepts
+        // the same fallback that mock auto mode selects.
+        if (snapshot.decisionOptions.empty() && snapshot.activeQuests.empty() &&
+            !snapshot.inCombat && !snapshot.isMoving &&
+            !snapshot.grindMode && !snapshot.lifecycleActive && !snapshot.travelActive &&
+            !snapshot.professionActive)
+        {
+            for (size_t index = 0; index < snapshot.navCandidates.size(); ++index)
+            {
+                auto const& candidate = snapshot.navCandidates[index];
+                if (!candidate.canMove || !candidate.reachable || candidate.temporarilyBlocked)
+                    continue;
+                ControlDecisionOption option;
+                option.action = "request_move_hop";
+                option.reason = "continue searching for the next mission objective";
+                option.distance = candidate.distance2d;
+                option.local = false;
+                option.destinationType = "mission_search";
+                option.navigationDirection = candidate.direction;
+                option.candidateId = "nav_" + std::to_string(index);
+                addDecisionOption(std::move(option), "continue_mission_search | " + candidate.direction +
+                                  " | " + DistanceText(candidate.distance2d));
+                break;
             }
         }
 
@@ -3129,6 +3296,7 @@ request_profession format:
                         objectiveTypes.push_back(objective.type);
                     }
                     objectives.push_back({{"type", objective.type},
+                                          {"objective_index", objective.objectiveIndex},
                                           {"target_name", objective.targetName},
                                           {"current", objective.current},
                                           {"required", objective.required}});
@@ -3235,6 +3403,7 @@ request_profession format:
             bool turnIn = option.questId && std::any_of(bot.activeQuests.begin(), bot.activeQuests.end(),
                 [&](auto const& quest) { return quest.questId == option.questId && quest.status == QUEST_STATUS_COMPLETE; });
             int priority = turnIn ? (option.action == "request_stop_grind" ? 0 : option.local ? 1 : 2) :
+                option.destinationType == "quest_giver" ? (option.local ? 3 : 4) :
                 option.lifecycleTravel ? 10 : option.objectiveType.empty() ? 30 : 20;
             decisionOptions.push_back({
                 {"action", option.action},
@@ -4703,11 +4872,6 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                 break;
             }
         }
-        if (state.movement.IsMoving())
-        {
-            continue;
-        }
-
         if (state.profession.Active())
         {
             // While a profession session is running, do not invoke the LLM/controller.
@@ -4717,15 +4881,21 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             continue;
 
         // Deterministic lifecycle work runs before every LLM pause/cooldown gate.
-        // Existing Amigo movement/profession operations are allowed to finish, then
-        // Needs/Maintenance can own execution without rewriting BotMission.
+        // Urgent maintenance must be able to preempt a stalled Amigo movement;
+        // optional maintenance still waits for movement to finish.
         {
             BotMissionState lifecycleMission = BotMissionRegistry::Instance().Get(guid);
             const bool optionalMaintenanceWindow = !bot->IsInCombat() &&
+                                                   !state.movement.IsMoving() &&
                                                    !bot->isMoving() &&
                                                    !state.travel.Active();
             if (ServiceDeterministicLifecycle(bot, ai, lifecycleMission.revision, optionalMaintenanceWindow))
                 continue;
+        }
+
+        if (state.movement.IsMoving())
+        {
+            continue;
         }
 
         if (state.promptInFlight.load(std::memory_order_relaxed))
@@ -5408,8 +5578,9 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
                     if (g_EnableOllamaBotControlDebug || g_EnableOllamaBotAmigoDebug)
                     {
                         LOG_INFO("server.loading",
-                                 "[OllamaBotAmigo] Mock control no-op for {}: no server-approved decision option is currently available.",
-                                 snapshot.botName);
+                                 "[OllamaBotAmigo] Mock control no-op for {}: options={}, quests={}, lane={}, moving={}, travel_active={}.",
+                                 snapshot.botName, snapshot.decisionOptions.size(), snapshot.activeQuests.size(),
+                                 snapshot.lifecycle.LaneName(), snapshot.isMoving, snapshot.travelActive);
                     }
                     stateRef->nextPlannerShortTickMs.store(
                         getMSTime() + GetPlannerShortTermDelayMs(), std::memory_order_relaxed);

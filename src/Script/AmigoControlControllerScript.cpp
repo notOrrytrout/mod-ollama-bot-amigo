@@ -1,4 +1,5 @@
 #include "Script/AmigoControlControllerScript.h"
+#include "Util/QuestItemSources.h"
 #include "Ai/ControlAction.h"
 #include "Bot/BotControlApi.h"
 #include "Script/OllamaBotConfig.h"
@@ -694,7 +695,7 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
 
         bool reachable = WorldChecks::CanReach(player, dest);
         bool hasLOS = WorldChecks::IsWithinLOS(player, dest);
-        if (!reachable)
+        if (!WorldChecks::IsSafeGroundDestination(player, dest) || !reachable)
         {
             LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting move_hop_npc: destination not reachable for {} (entry_id={}, los={})",
                      player->GetName(),
@@ -875,7 +876,7 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         // This reduces impossible tool calls (e.g., points inside terrain or behind unreached geometry).
         bool reachable = WorldChecks::CanReach(player, dest);
         bool hasLOS = WorldChecks::IsWithinLOS(player, dest);
-        if (!reachable)
+        if (!WorldChecks::IsSafeGroundDestination(player, dest) || !reachable)
         {
             LOG_INFO(
                 "server.loading",
@@ -974,6 +975,8 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
                 for (uint8 index = 0; index < QUEST_OBJECTIVES_COUNT; ++index)
                     remaining = remaining || (quest->RequiredNpcOrGo[index] == static_cast<int32>(target->GetEntry()) &&
                         status->second.CreatureOrGOCount[index] < quest->RequiredNpcOrGoCount[index]);
+            remaining = remaining || AmigoNeedsQuestItemFrom(player, actionState.action.questId,
+                static_cast<int32>(target->GetEntry()));
             if (!remaining)
             {
                 LOG_INFO("server.loading", "[OllamaBotAmigo] Attack rejected: objective_invalid for {}", player->GetName());
@@ -1001,7 +1004,10 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         }
 
         BotMissionState missionState = BotMissionRegistry::Instance().Get(guid);
-        if (missionState.mission.kind != BotMissionKind::Gather || missionState.mission.target.empty())
+        bool questGather = missionState.mission.kind == BotMissionKind::Quest && actionState.action.questId &&
+            AmigoNeedsQuestItemFrom(player, actionState.action.questId,
+                -static_cast<int32>(actionState.action.gameObjectEntryId));
+        if (!questGather && (missionState.mission.kind != BotMissionKind::Gather || missionState.mission.target.empty()))
         {
             LOG_INFO("server.loading", "[OllamaBotAmigo] Rejecting targeted gather outside a named gather mission for {}", player->GetName());
             return;
@@ -1017,7 +1023,7 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         }
 
         LootObject loot(player, target->GetGUID());
-        if (loot.IsEmpty() || loot.skillId == SKILL_NONE || !loot.IsLootPossible(player))
+        if (loot.IsEmpty() || (!questGather && loot.skillId == SKILL_NONE) || !loot.IsLootPossible(player))
         {
             LOG_INFO("server.loading",
                      "[OllamaBotAmigo] Rejecting targeted gather for {}: {} (entry={}) is not gatherable with current Playerbots loot rules",

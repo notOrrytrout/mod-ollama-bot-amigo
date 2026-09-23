@@ -39,7 +39,6 @@ namespace
         if (!bot || !ai || !bot->GetGroup())
             return;
 
-        ai->SetExternalAuthority(true);
         ai->SetMaster(nullptr);
 
         if (ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
@@ -54,6 +53,7 @@ AmigoGroupAuthorityScript::AmigoGroupAuthorityScript()
 
 void AmigoGroupAuthorityScript::ClearDirective(bool normalizePeer, char const* reason)
 {
+    (void)normalizePeer;
     Player* bot = activeBotGuid_ ? ObjectAccessor::FindConnectedPlayer(ObjectGuid(activeBotGuid_)) : FindConfiguredBot();
     if (bot)
     {
@@ -62,7 +62,6 @@ void AmigoGroupAuthorityScript::ClearDirective(bool normalizePeer, char const* r
             if (ai->HasStrategy("follow", BOT_STATE_NON_COMBAT))
                 ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
 
-            ai->SetExternalAuthority(normalizePeer);
             if (bot->GetSession() && !bot->GetSession()->IsBot())
                 ai->SetMaster(bot);
             else
@@ -110,8 +109,6 @@ void AmigoGroupAuthorityScript::OnUpdate(uint32 diff)
         return;
 
     const uint64 botGuid = bot->GetGUID().GetRawValue();
-    ai->SetExternalAuthority(g_OllamaBotRuntime.enable_control && g_AmigoGroupAuthority != "playerbots");
-
     // Playerbots uses self-master identity to send object updates to a real
     // client. Peer ownership changes must never remove that identity.
     if (bot->GetSession() && !bot->GetSession()->IsBot())

@@ -50,6 +50,41 @@ namespace WorldChecks
         return std::sqrt(dx * dx + dy * dy);
     }
 
+    bool ResolveGroundZ(Player* bot, float x, float y, float referenceZ, float& outZ)
+    {
+        if (!bot || !bot->GetMap())
+            return false;
+
+        // Playerbots uses this floor-aware lookup for movement. Do not use
+        // MAX_HEIGHT here because it can resolve a roof above the bot.
+        float ground = bot->GetMapHeight(x, y, referenceZ);
+        float water = bot->GetMap()->GetWaterLevel(x, y);
+        if (ground == INVALID_HEIGHT && water == INVALID_HEIGHT)
+            return false;
+
+        outZ = ground;
+        if (water != INVALID_HEIGHT && (ground == INVALID_HEIGHT || water > ground) && bot->IsInWater())
+            outZ = water;
+        return outZ != INVALID_HEIGHT;
+    }
+
+    bool IsSafeGroundDestination(Player* bot, WorldPosition const& pos, float maxVerticalDelta)
+    {
+        if (!bot)
+            return false;
+
+        WorldPosition posCopy = pos;
+        if (bot->GetMapId() != posCopy.GetMapId())
+            return false;
+
+        float groundZ = 0.0f;
+        if (!ResolveGroundZ(bot, posCopy.GetPositionX(), posCopy.GetPositionY(), bot->GetPositionZ(), groundZ))
+            return false;
+
+        return std::fabs(groundZ - bot->GetPositionZ()) <= maxVerticalDelta &&
+               std::fabs(posCopy.GetPositionZ() - groundZ) <= 1.5f;
+    }
+
     bool CanReach(Player* bot, WorldPosition const& pos, float tolerance)
     {
         if (!bot)

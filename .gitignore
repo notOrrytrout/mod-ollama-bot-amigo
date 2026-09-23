@@ -1,5 +1,21 @@
 .DS_Store
 *.pyc
+__pycache__/
+
+# Local plans and build helpers
 PLAN.md
 quick-rebuild.sh
+/verify.sh
+/.agents/plans/
+
+# Generated build files
 build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+
+# Local configuration and credentials (keep *.conf.dist templates)
+*.conf
+.env
+.env.*

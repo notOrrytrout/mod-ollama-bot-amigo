@@ -158,8 +158,8 @@ void BotMovement::Abort(MoveReason /*reason*/)
     if (AmigoOwnsPoint(issuedPoint_, splineId_, bot_->movespline->GetId(),
         bot_->GetMotionMaster()->GetCurrentMovementGeneratorType() == POINT_MOTION_TYPE))
     {
-        if (ai_)
-            ai_->StopMovement();
+        bot_->GetMotionMaster()->Clear(false);
+        bot_->GetMotionMaster()->MoveIdle();
     }
     issuedPoint_ = false;
     active_ = false;
@@ -220,11 +220,12 @@ void BotMovement::Advance()
 {
     if (path_.empty())
         return;
-    // Playerbots executes the destination. The validation path is not used
-    // for progress; progress comes from the active native spline.
-    if (!ai_ || !ai_->MoveToPosition(destMapId_, destX_, destY_, destZ_,
-        reason_ == MoveReason::Combat ? MovementPriority::MOVEMENT_COMBAT : MovementPriority::MOVEMENT_NORMAL))
+    // The reverted Playerbots API does not expose MoveToPosition(). Use the
+    // core movement API after validating the route above.
+    if (!bot_ || bot_->GetMapId() != destMapId_)
         return;
+
+    bot_->GetMotionMaster()->MovePoint(0, destX_, destY_, destZ_);
 
     splineId_ = bot_->movespline->GetId();
     issuedGenerator_ = bot_->GetMotionMaster()->top();

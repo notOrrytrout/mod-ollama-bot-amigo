@@ -132,5 +132,46 @@ int main()
     state["bot"]["lifecycle_active"] = false;
     state["decision_options"] = Json::array();
     Check(SelectControlDecision(state).empty(), "no legal action must be a no-op");
+    state["nav"]["candidates"] = Json::array({
+        Json{{"candidate_id", "nav_4"}, {"can_move", true}, {"reachable", true}, {"temporarily_blocked", false}}});
+    state["bot"]["is_moving"] = false;
+    auto fallback = SelectControlDecision(state);
+    Check(fallback.at("name") == "request_move_hop", "auto mode must use a reachable navigation fallback");
+    Check(fallback.at("arguments").at("nav_epoch") == 7, "navigation fallback must use the current epoch");
+    Check(fallback.at("arguments").at("candidate_id") == "nav_4", "navigation fallback must use the server candidate");
+    state["bot"]["is_moving"] = true;
+    Check(SelectControlDecision(state).empty(), "moving bot must retain movement ownership");
+
+    state["bot"]["is_moving"] = false;
+    state["bot"]["active_quests"] = Json::array({{{"status", "incomplete"}}});
+    state["decision_options"] = Json::array({
+        Json{{"action", "request_move_hop"}, {"priority", 20},
+             {"objective_type", "creature"}, {"objective_target_id", 1234},
+             {"arguments", {{"candidate_id", "nav_9"}}}}});
+    auto objectiveMove = SelectControlDecision(state);
+    Check(objectiveMove.at("name") == "request_move_hop", "mock auto must move toward an incomplete creature objective");
+    Check(objectiveMove.at("arguments").at("candidate_id") == "nav_9", "objective movement must use the server candidate");
+
+    state["decision_options"] = Json::array({
+        Json{{"action", "request_move_hop"}, {"priority", 4}, {"quest_id", 180},
+             {"arguments", {{"candidate_id", "nav_6"}}}},
+        Json{{"action", "request_attack_target"}, {"priority", 20}, {"objective_type", "creature"},
+             {"arguments", {{"entry_id", 705}}}}});
+    auto questGiverMove = SelectControlDecision(state);
+    Check(questGiverMove.at("name") == "request_move_hop", "quest giver movement must precede quest objectives");
+    Check(questGiverMove.at("arguments").at("candidate_id") == "nav_6", "quest giver movement must use its candidate");
+    state["decision_options"] = Json::array();
+    Check(SelectControlDecision(state).empty(), "active quest must not use generic mountain-prone navigation fallback");
+    state["decision_options"] = Json::array({
+        Json{{"action", "request_attack_target"}, {"priority", 20}, {"quest_id", 313},
+             {"objective_type", "item"}, {"objective_target_id", 2671}, {"source_target", "quest loot source"},
+             {"arguments", {{"entry_id", 1961}}}}});
+    Check(SelectControlDecision(state).at("arguments").at("entry_id") == 1961,
+        "item objective must attack the mapped creature entry, not the item entry");
+    state["decision_options"][0]["action"] = "request_gather_target";
+    Check(SelectControlDecision(state).at("name") == "request_gather_target",
+        "item objective must permit a server-approved object collection");
+    state["bot"]["active_quests"][0]["status"] = "complete";
+    Check(SelectControlDecision(state).empty(), "completed quest must suppress further item collection");
     std::cout << "Control decision checks passed\n";
 }

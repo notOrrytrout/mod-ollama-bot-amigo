@@ -30,6 +30,7 @@
 - **PlayerbotAI command bridge:** Tool calls map to Playerbot commands (move/grind/talk/turn); combat tactics remain inside PlayerbotAI.
 - **Navigation + travel semantics:** The module builds nav candidates, validates reachability, and tracks move hop completion.
 - **Quest and world snapshots:** Exposes active quests, quest givers in range, nearby entities, and local/world labels.
+- **Item quest objectives:** Uses Playerbots loot data to find known creature and game-object sources, then emits only validated attack or gather actions for the required item.
 - **Profession execution (fishing only):** `request_fish` and `request_profession` support fishing; other professions are rejected for now.
 - **Persistent memory tables:** Optional planner/stuck/vendor tables in CharacterDatabase; currently used for cooldown/backoff and diagnostics (not injected into prompts yet).
 - **Configurable models and logging:** Per-role models/prompts, tick timing, and debug logging toggles.
@@ -334,3 +335,12 @@ OllamaBotControl.Llm.Mock.Chat.Enable = 0
 ```
 
 `Mock.Chat.Enable = 0` sends direct social replies and event chatter through the configured real LLM provider. `Mock.Control.Enable = 1` keeps action selection on the deterministic mock path.
+
+The control and planner mocks run inside Amigo. They do not require a separate mock server. This keeps gameplay decisions deterministic while chat can continue to use the configured real provider. The optional `src/Tools/ollama_stub.py` process remains available for testing the HTTP client path and is not required for normal runtime mock use.
+
+
+## Quest item source behavior
+
+For an active quest item objective, Amigo checks Playerbots' server-side loot data before it selects a target. It can route to a nearby creature that can drop the item or to a nearby game object that provides it. The controller checks the same objective state before it executes the attack or gather action.
+
+If no valid source is known or the bot already has enough of the item, Amigo does not invent a kill target. It waits for another valid control action or for the normal Playerbots systems to make progress.

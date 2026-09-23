@@ -42,5 +42,30 @@ inline nlohmann::json SelectControlDecision(nlohmann::json const& state)
         selected = {{"name", action}, {"arguments", arguments}};
         bestPriority = priority;
     }
+
+    // Use a reachable server navigation candidate when no more specific
+    // action is available. This keeps mock auto mode moving while the bot
+    // searches for its next quest or mission objective.
+    // Do not wander on radial navigation candidates while a quest is active.
+    // Those candidates are not quest routes and can send the bot toward a
+    // steep or otherwise unsuitable approach to the quest target.
+    bool hasActiveQuest = !bot.value("active_quests", nlohmann::json::array()).empty();
+    if (selected.empty() && !hasActiveQuest && !bot.value("is_moving", false))
+    {
+        auto const& nav = state.value("nav", nlohmann::json::object());
+        uint32_t navEpoch = nav.value("nav_epoch", 0u);
+        for (auto const& candidate : nav.value("candidates", nlohmann::json::array()))
+        {
+            if (!candidate.value("can_move", false) || !candidate.value("reachable", false) ||
+                candidate.value("temporarily_blocked", false))
+                continue;
+            std::string candidateId = candidate.value("candidate_id", "");
+            if (candidateId.empty())
+                continue;
+            selected = {{"name", "request_move_hop"},
+                        {"arguments", {{"nav_epoch", navEpoch}, {"candidate_id", candidateId}}}};
+            break;
+        }
+    }
     return selected;
 }

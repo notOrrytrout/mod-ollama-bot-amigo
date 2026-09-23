@@ -63,7 +63,6 @@ bool BotProfession::StartFishing(Player* bot, PlayerbotAI* ai, uint32_t nowMs)
         }
     }
 
-    fishingCompletionBaseline_ = ai->GetFishingCompletions();
     // Start fishing through Playerbots. Playerbots owns pole equipment, the
     // cast, and the bobber strategy.
     if (!ai->DoSpecificAction(kActionGoFishing, Event(), true))
@@ -98,15 +97,6 @@ void BotProfession::Update(Player* bot, PlayerbotAI* ai, uint32_t nowMs)
 
     if (activity_ != ProfessionActivity::Fishing)
         return;
-
-    if (ai->GetFishingCompletions() != fishingCompletionBaseline_)
-    {
-        active_ = false;
-        activity_ = ProfessionActivity::None;
-        lastResult_ = ProfessionResult::Succeeded;
-        lastChangeMs_ = nowMs;
-        return;
-    }
 
     if (nowMs - startMs_ > kFishingTimeoutMs)
     {
