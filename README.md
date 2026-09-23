@@ -51,21 +51,26 @@
      - Ollama LLM API server (https://ollama.com), running locally or accessible over your network.
 
 2. **Clone the Module:**
+   ```sh
    cd /path/to/azerothcore/modules
-   git clone (https://github.com/notOrrytrout/mod-ollama-bot-amigo.git)
+   git clone https://github.com/notOrrytrout/mod-ollama-bot-amigo.git
+   ```
 
 3. **Recompile AzerothCore:**
+   ```sh
    cd /path/to/azerothcore
-   mkdir build && cd build
-   cmake ..
-   make -j$(nproc)
+   cmake -S . -B build
+   cmake --build build --parallel
+   ```
 
 4. **Configuration:**
    Copy the sample config and adjust as needed:
-   cp /path/to/azerothcore/modules/mod-ollama-bot-amigo/mod_ollama_bot_amigo.conf.dist /path/to/azerothcore/etc/config/mod_ollama_bot_amigo.conf
+   ```sh
+   cp /path/to/azerothcore/modules/mod-ollama-bot-amigo/conf/mod_ollama_bot_amigo.conf.dist /path/to/azerothcore/etc/modules/mod_ollama_bot_amigo.conf
+   ```
 
 5. **Restart the Server:**
-   ./worldserver
+   Start the `worldserver` binary from the AzerothCore build or install directory.
 
 ## Configuration Options
 
@@ -206,7 +211,7 @@ Examples:
    The module summarizes the bot's state, quests, nearby entities, and navigation candidates.
 
 3. **Planner (Optional):**
-   If enabled, the planner generates a long-term goal and exactly three short-term goals (long/short planner models can be configured separately).
+   If enabled, the planner generates one long-term goal and one short-term goal at a time. Long-term and short-term planner models can be configured separately.
 
 4. **LLM Control Decision:**
    The control LLM receives the current goals plus a control-focused snapshot and responds with a single tool call.
@@ -244,13 +249,13 @@ The stub emits tool calls using the exact `<tool_call>{\"name\":...,\"arguments\
 - If your bots do not respond, check that their names match the control string in the loop.
 - If you see missing `OllamaBotControl.SystemPrompt.*` warnings, add those keys to `mod_ollama_bot_amigo.conf` (the defaults are included in the `.conf.dist` file). Single-line prompts are accepted if you prefer not to embed newlines in the config.
 - If you see missing model or memory-related warnings, copy the missing keys from `mod_ollama_bot_amigo.conf.dist` into your live config.
-- If you see `Ollama API returned HTTP 404`, confirm `OllamaBotControl.Url` points to a running Ollama server and the `/api/generate` endpoint.
-- Ensure the Ollama server is running and reachable from your server.
+- If you see an HTTP 404, confirm that `OllamaBotControl.Llm.Provider` and `OllamaBotControl.Url` match the configured provider. Ollama uses `/api/generate`; oMLX uses `/v1/chat/completions`.
+- Ensure the selected LLM provider is running and reachable from your server.
 - Check your build includes all dependencies (curl, fmt, nlohmann/json).
 
 ## License
 
-This module is released under the GNU GPL v3 license, consistent with AzerothCore's licensing.
+This module is released under the GNU Affero General Public License v3.0 (`AGPL-3.0-only`). See [LICENSE](LICENSE).
 
 ## Thanks
 
@@ -334,7 +339,7 @@ OllamaBotControl.Llm.Mock.Planner.Enable = 1
 OllamaBotControl.Llm.Mock.Chat.Enable = 0
 ```
 
-`Mock.Chat.Enable = 0` sends direct social replies and event chatter through the configured real LLM provider. `Mock.Control.Enable = 1` keeps action selection on the deterministic mock path.
+When chat is enabled, `Mock.Chat.Enable = 0` sends direct social replies and event chatter through the configured real LLM provider. `Mock.Control.Enable = 1` keeps action selection on the deterministic mock path.
 
 The control and planner mocks run inside Amigo. They do not require a separate mock server. This keeps gameplay decisions deterministic while chat can continue to use the configured real provider. The optional `src/Tools/ollama_stub.py` process remains available for testing the HTTP client path and is not required for normal runtime mock use.
 
