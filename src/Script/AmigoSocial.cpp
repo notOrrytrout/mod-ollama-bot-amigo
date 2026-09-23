@@ -4,6 +4,7 @@
 #include "Ai/LlmDispatch.h"
 #include "Ai/OllamaClient.h"
 #include "Script/OllamaBotConfig.h"
+#include "Util/AmigoBotNames.h"
 
 #include "Group.h"
 #include "ObjectAccessor.h"
@@ -53,15 +54,20 @@ namespace
     {
         if (!player || !player->IsInWorld())
             return false;
-        if (player->GetName() != g_OllamaBotControlBotName)
+        if (!IsAmigoBotNameAllowed(g_OllamaBotControlBotName, player->GetName()))
             return false;
         return PlayerbotsMgr::instance().GetPlayerbotAI(player) != nullptr;
     }
 
-    Player* FindConfiguredBot()
+    Player* FindConfiguredBot(Group* group = nullptr)
     {
-        Player* bot = ObjectAccessor::FindPlayerByName(g_OllamaBotControlBotName);
-        return IsConfiguredBot(bot) ? bot : nullptr;
+        for (auto const& entry : ObjectAccessor::GetPlayers())
+        {
+            Player* bot = entry.second;
+            if (IsConfiguredBot(bot) && (!group || bot->GetGroup() == group))
+                return bot;
+        }
+        return nullptr;
     }
 
     AmigoSocialIntent ParseIntent(Player* player, std::string const& message)
@@ -115,10 +121,11 @@ namespace
         return intent;
     }
 
-    std::string BuildChatPrompt(uint64 botGuid, std::string const& speaker, std::string const& message)
+    std::string BuildChatPrompt(uint64 botGuid, std::string const& botName,
+                                std::string const& speaker, std::string const& message)
     {
         std::ostringstream oss;
-        oss << "You are " << g_OllamaBotControlBotName << ", a World of Warcraft player character controlled by Amigo.\n";
+        oss << "You are " << botName << ", a World of Warcraft player character controlled by Amigo.\n";
         oss << "Speak like a player, not like an assistant. Keep the reply short and natural.\n";
         oss << "Do not claim you performed an action unless CURRENT MIND STATE says it happened.\n";
         oss << "Do not emit commands, JSON, tool names, or implementation details.\n";
@@ -144,7 +151,7 @@ namespace
         uint64 botGuid = bot->GetGUID().GetRawValue();
         uint64 speakerGuid = speaker->GetGUID().GetRawValue();
         std::string speakerName = speaker->GetName();
-        std::string prompt = BuildChatPrompt(botGuid, speakerName, message);
+        std::string prompt = BuildChatPrompt(botGuid, bot->GetName(), speakerName, message);
         std::string model = g_OllamaBotControlChatModel;
 
         AmigoSocialIntent intent = ParseIntent(speaker, message);
@@ -264,7 +271,7 @@ bool AmigoSocialScript::OnPlayerCanUseChat(Player* player, uint32 /*type*/, uint
     if (!g_AmigoChatEnable || !player || !group || IsCommandLike(msg))
         return true;
 
-    Player* bot = FindConfiguredBot();
+    Player* bot = FindConfiguredBot(group);
     if (!bot || bot == player || bot->GetGroup() != group)
         return true;
 

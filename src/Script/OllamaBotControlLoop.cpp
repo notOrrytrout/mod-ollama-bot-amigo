@@ -13,6 +13,7 @@
 #include "DBCStores.h"
 #include "Util/PlayerbotsCompat.h"
 #include "Util/QuestItemSources.h"
+#include "Util/AmigoBotNames.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "Item.h"
@@ -2927,6 +2928,7 @@ request_profession format:
                         if (objective.type == "game_object" && entity.type == "game_object" &&
                             objective.targetId == -static_cast<int32>(entity.entryId))
                         {
+                            bool optionAdded = false;
                             if (entity.distance <= INTERACTION_DISTANCE &&
                                 bot->IsWithinLOS(entity.pos.x, entity.pos.y, entity.pos.z))
                             {
@@ -2939,6 +2941,7 @@ request_profession format:
                                 option.objectiveType = objective.type;
                                 option.objectiveTargetId = objective.targetId;
                                 addDecisionOption(std::move(option), "use_quest_object:" + entity.name);
+                                optionAdded = true;
                             }
                             else
                             {
@@ -2958,10 +2961,13 @@ request_profession format:
                                     option.objectiveTargetId = objective.targetId;
                                     option.reason = "approach the required quest object";
                                     addDecisionOption(std::move(option), "move_to_quest_object:" + entity.name);
+                                    optionAdded = true;
                                     break;
                                 }
                             }
-                            break;
+                            if (optionAdded)
+                                break;
+                            continue;
                         }
                         bool itemSource = objective.type == "item" && AmigoDropsQuestItem(
                             entity.type == "npc" ? static_cast<int32>(entity.entryId) :
@@ -4761,25 +4767,8 @@ void OllamaBotControlLoop::OnUpdate(uint32 diff)
             continue;
         }
 
-        if (!g_OllamaBotControlBotName.empty())
-        {
-            // Optional bot-name allowlist (comma separated).
-            bool allowed = false;
-            std::stringstream ss(g_OllamaBotControlBotName);
-            std::string name;
-
-            while (std::getline(ss, name, ','))
-            {
-                if (bot->GetName() == name)
-                {
-                    allowed = true;
-                    break;
-                }
-            }
-
-            if (!allowed)
-                continue;
-        }
+        if (!IsAmigoBotNameAllowed(g_OllamaBotControlBotName, bot->GetName()))
+            continue;
 
         // Autonomous login uses Playerbots' random-bot path. Remove its
         // background movement before Amigo evaluates the next control action.

@@ -3,6 +3,7 @@
 #include "Ai/BotMindState.h"
 #include "Ai/OllamaRuntime.h"
 #include "Script/OllamaBotConfig.h"
+#include "Util/AmigoBotNames.h"
 
 #include "Group.h"
 #include "Log.h"
@@ -21,12 +22,16 @@ namespace
 
     Player* FindConfiguredBot()
     {
-        if (g_OllamaBotControlBotName.empty())
-            return nullptr;
-        Player* bot = ObjectAccessor::FindPlayerByName(g_OllamaBotControlBotName);
-        if (!bot || !bot->IsInWorld())
-            return nullptr;
-        return PlayerbotsMgr::instance().GetPlayerbotAI(bot) ? bot : nullptr;
+        for (auto const& entry : ObjectAccessor::GetPlayers())
+        {
+            Player* bot = entry.second;
+            if (!bot || !bot->IsInWorld() ||
+                !IsAmigoBotNameAllowed(g_OllamaBotControlBotName, bot->GetName()))
+                continue;
+            if (PlayerbotsMgr::instance().GetPlayerbotAI(bot))
+                return bot;
+        }
+        return nullptr;
     }
 
     bool SameGroup(Player const* a, Player const* b)

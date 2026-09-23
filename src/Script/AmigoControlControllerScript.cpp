@@ -1,5 +1,6 @@
 #include "Script/AmigoControlControllerScript.h"
 #include "Util/QuestItemSources.h"
+#include "Util/AmigoBotNames.h"
 #include "Ai/ControlAction.h"
 #include "Bot/BotControlApi.h"
 #include "Script/OllamaBotConfig.h"
@@ -14,6 +15,7 @@
 #include "ObjectMgr.h"
 #include "GameObject.h"
 #include "LootObjectStack.h"
+#include "ChatHelper.h"
 #include "ObjectAccessor.h"
 #include "Bot/BotTravel.h"
 #include "Bot/BotProfession.h"
@@ -328,7 +330,6 @@ namespace
         bool initialRewarded = false;
         uint32 lastAcceptAttemptMs = 0;
         uint8 acceptAttempts = 0;
-        bool acceptDone = false;
         bool ltgRefreshDone = false;
     };
 
@@ -383,22 +384,23 @@ namespace
             return false;
         };
 
-        auto tryAcceptAll = [&]()
+        auto tryAcceptQuest = [&]()
         {
             if (!reselectionOk())
             {
                 return;
             }
 
-            // Auto-accept all available quests from this quest giver.
+            Quest const* quest = sObjectMgr->GetQuestTemplate(pending.questId);
+            if (!quest)
+                return;
+
+            // Accept only the selected quest. Playerbots' wildcard command
+            // accepts quests from every nearby giver.
             BotControlCommand acceptCmd;
             acceptCmd.type = BotControlCommandType::PlayerbotCommand;
-            // Playerbots' "accept" chat command maps to AcceptQuestAction and only accepts anything when:
-            // - a quest id is provided, or
-            // - the special param "*" is provided (accept all quests from nearby quest givers in interaction range).
-            // Without a param it will no-op, which looks like "it listed quests but didn't accept them".
-            acceptCmd.args = { "accept *" };
-            EnqueueBotControlCommand(bot, acceptCmd, "auto_accept_all_on_talk");
+            acceptCmd.args = { "accept " + ChatHelper::FormatQuest(quest) };
+            EnqueueBotControlCommand(bot, acceptCmd, "accept_selected_quest");
             pending.lastAcceptAttemptMs = nowMs;
             if (pending.acceptAttempts < std::numeric_limits<uint8>::max())
             {
@@ -416,12 +418,6 @@ namespace
             }
             LOG_INFO("server.loading", "[OllamaBotAmigo] Quest completion verified for {}: quest_id={} rewarded=true",
                      bot->GetName(), pending.questId);
-            if (!pending.acceptDone)
-            {
-                tryAcceptAll();
-                pending.acceptDone = true;
-            }
-
             // Request an LTG refresh, guarded to avoid spamming when turning in many quests quickly.
             if (!pending.ltgRefreshDone)
             {
@@ -468,14 +464,14 @@ namespace
             {
                 if (nowMs - pending.startedMs >= kAcceptInitialDelayMs)
                 {
-                    tryAcceptAll();
+                    tryAcceptQuest();
                 }
                 return;
             }
 
             if (nowMs - pending.lastAcceptAttemptMs >= kAcceptRetryEveryMs)
             {
-                tryAcceptAll();
+                tryAcceptQuest();
             }
         }
     }
@@ -530,7 +526,7 @@ void AmigoControlControllerScript::OnPlayerAfterUpdate(Player* player, uint32 /*
         return;
     }
 
-    if (!g_OllamaBotControlBotName.empty() && player->GetName() != g_OllamaBotControlBotName)
+    if (!IsAmigoBotNameAllowed(g_OllamaBotControlBotName, player->GetName()))
     {
         return;
     }

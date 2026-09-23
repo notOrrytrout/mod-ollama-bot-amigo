@@ -8,6 +8,7 @@
 #include "Script/OllamaBotControlLoop.h"
 #include "Log.h"
 #include "Util/PlayerbotsCompat.h"
+#include "Util/AmigoBotNames.h"
 #include "Timer.h"
 
 namespace
@@ -198,7 +199,7 @@ void AmigoBotLoginScript::OnPlayerLogin(Player* player)
         return;
     }
 
-    if (!g_OllamaBotControlBotName.empty() && player->GetName() != g_OllamaBotControlBotName)
+    if (!IsAmigoBotNameAllowed(g_OllamaBotControlBotName, player->GetName()))
     {
         return;
     }
